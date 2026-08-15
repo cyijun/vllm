@@ -40,6 +40,7 @@ from vllm.model_executor.layers.fused_moe.all2all_utils import (
 from vllm.model_executor.layers.fused_moe.config import nvfp4_moe_quant_config
 from vllm.model_executor.layers.fused_moe.experts.flashinfer_b12x_moe import (
     FlashInferB12xExperts,
+    _sanitize_b12x_topk,
 )
 from vllm.model_executor.layers.quantization.utils.flashinfer_fp4_moe import (
     reorder_w1w3_to_w3w1,
@@ -100,6 +101,33 @@ def test_flashinfer_b12x_wrapper_receives_swiglu_limit(monkeypatch):
 
     assert captured["activation"] == "silu"
     assert captured["swiglu_limit"] == 10.0
+
+
+def test_flashinfer_b12x_sanitizes_padding_routes():
+    topk_ids = torch.tensor([[3, -1, 5], [-1, -1, 2]], dtype=torch.int64, device="cuda")
+    topk_weights = torch.tensor(
+        [[0.5, 0.25, 0.125], [1.0, -2.0, 0.75]],
+        dtype=torch.float32,
+        device="cuda",
+    )
+
+    safe_ids, safe_weights = _sanitize_b12x_topk(topk_ids, topk_weights)
+
+    torch.testing.assert_close(
+        safe_ids,
+        torch.tensor([[3, 0, 5], [0, 0, 2]], dtype=torch.int32, device="cuda"),
+    )
+    torch.testing.assert_close(
+        safe_weights,
+        torch.tensor(
+            [[0.5, 0.0, 0.125], [0.0, 0.0, 0.75]],
+            dtype=torch.float32,
+            device="cuda",
+        ),
+    )
+    # Sanitization must not mutate tensors potentially reused by other stages.
+    assert (topk_ids == -1).sum().item() == 3
+    assert topk_weights[1, 1].item() == -2.0
 
 
 @pytest.mark.parametrize("m,n,k", MNK_FACTORS)

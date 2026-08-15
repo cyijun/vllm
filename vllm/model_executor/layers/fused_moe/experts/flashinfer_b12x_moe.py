@@ -27,6 +27,16 @@ from vllm.utils.flashinfer import (
 )
 
 
+def _sanitize_b12x_topk(
+    topk_ids: torch.Tensor, topk_weights: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map vLLM's padding sentinel to a safe, zero-weight B12X route."""
+    is_padding = topk_ids < 0
+    safe_ids = topk_ids.masked_fill(is_padding, 0).to(torch.int32)
+    safe_weights = topk_weights.masked_fill(is_padding, 0.0)
+    return safe_ids, safe_weights
+
+
 class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
     """FlashInfer CuteDSL fused MoE expert for SM12x (SM120/SM121,
     RTX Pro 6000 / DGX Spark).
@@ -282,6 +292,14 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
         wrapper = self._wrapper
         assert wrapper is not None
 
+        # vLLM uses -1 expert IDs for cudagraph/profile padding.  Most MoE
+        # backends consume that sentinel directly, while B12X requires every
+        # expert ID to be in range.  Route padding through expert 0 with a zero
+        # scale so the output remains zero without an out-of-bounds access.
+        token_selected_experts, token_final_scales = _sanitize_b12x_topk(
+            topk_ids, topk_weights
+        )
+
         wrapper_output = wrapper.run(
             x=hidden_states,
             w1_weight=w1,
@@ -291,7 +309,7 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             w2_weight=w2,
             w2_weight_sf=self.w2_sf_mma,
             w2_alpha=self.g2_alphas,
-            token_selected_experts=topk_ids.to(torch.int32),
-            token_final_scales=topk_weights,
+            token_selected_experts=token_selected_experts,
+            token_final_scales=token_final_scales,
         )
         output.copy_(wrapper_output)
