@@ -22,7 +22,7 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import (
     fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits,
-    has_deep_gemm,
+    is_deep_gemm_supported,
 )
 from vllm.utils.import_utils import has_cutedsl
 from vllm.utils.torch_utils import (
@@ -552,7 +552,7 @@ def sparse_attn_indexer(
                     q_slice_cast = q_slice
                     k_quant_cast = k_quant
                     k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
-                if current_platform.is_cuda() and not has_deep_gemm():
+                if current_platform.is_cuda() and not is_deep_gemm_supported():
                     if use_fp4_cache:
                         raise RuntimeError(
                             "The CUDA sparse indexer fallback supports FP8 cache only."
@@ -663,7 +663,7 @@ def sparse_attn_indexer(
             if use_fp4_cache
             else padded_q_quant_decode_tokens
         )
-        if current_platform.is_cuda() and not has_deep_gemm():
+        if current_platform.is_cuda() and not is_deep_gemm_supported():
             if use_fp4_cache:
                 raise RuntimeError(
                     "The CUDA sparse indexer fallback supports FP8 cache only."
@@ -864,7 +864,7 @@ class SparseAttnIndexer(CustomOp):
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
-        if current_platform.is_cuda() and not has_deep_gemm():
+        if current_platform.is_cuda() and not is_deep_gemm_supported():
             if self.use_fp4_cache:
                 raise RuntimeError(
                     "The CUDA sparse indexer fallback supports FP8 cache only."
