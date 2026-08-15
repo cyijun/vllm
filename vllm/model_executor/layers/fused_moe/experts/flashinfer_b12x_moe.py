@@ -240,7 +240,10 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             top_k=self.topk,
             hidden_size=self.hidden_dim,
             intermediate_size=self.intermediate_size_per_partition,
-            use_cuda_graph=True,
+            # Compilation and CUDA graphs are disabled for this integration.
+            # Use FlashInfer's process-wide eager workspace cache so every MoE
+            # layer does not retain its own max-token workspace.
+            use_cuda_graph=False,
             max_num_tokens=self.max_num_tokens,
             num_local_experts=self.num_local_experts,
             activation=self._activation_str,
