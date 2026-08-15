@@ -26,11 +26,6 @@ from vllm.utils.flashinfer import (
     has_flashinfer_b12x_moe,
 )
 
-# The eager FlashInfer wrapper shares one process-wide workspace. vLLM can
-# invoke successive MoE layers on different CUDA streams, so serialize reuse
-# with an event while preserving asynchronous execution on the active stream.
-_B12X_WORKSPACE_EVENT: torch.Event | None = None
-
 
 class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
     """FlashInfer CuteDSL fused MoE expert for SM12x (SM120/SM121,
@@ -273,8 +268,6 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool | None,
     ):
-        global _B12X_WORKSPACE_EVENT
-
         assert self.w1_scale is not None and self.w2_scale is not None, (
             "w1_scale and w2_scale must not be None for FlashInferB12xExperts"
         )
@@ -292,10 +285,6 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
         wrapper = self._wrapper
         assert wrapper is not None
 
-        stream = current_platform.current_stream()
-        if _B12X_WORKSPACE_EVENT is not None:
-            stream.wait_event(_B12X_WORKSPACE_EVENT)
-
         wrapper_output = wrapper.run(
             x=hidden_states,
             w1_weight=w1,
@@ -309,6 +298,3 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             token_final_scales=topk_weights,
         )
         output.copy_(wrapper_output)
-        if _B12X_WORKSPACE_EVENT is None:
-            _B12X_WORKSPACE_EVENT = torch.Event()
-        _B12X_WORKSPACE_EVENT.record(stream)
