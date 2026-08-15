@@ -119,7 +119,14 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
         assert isinstance(self.kv_cache_spec, SlidingWindowMLASpec | MLAAttentionSpec)
         mla_spec = cast(SlidingWindowMLASpec | MLAAttentionSpec, self.kv_cache_spec)
         self.block_size = mla_spec.block_size
-        self.use_fp4_cache = mla_spec.cache_dtype_str == "nvfp4_ds_mla"
+        # The compressor builder belongs to the fp32 state cache, whose local
+        # spec does not inherit the output MLA cache dtype.  Read the global
+        # cache setting as well so mixed prefill/decode metadata includes the
+        # decode split required by the NVFP4 two-stage compressor.
+        self.use_fp4_cache = (
+            mla_spec.cache_dtype_str == "nvfp4_ds_mla"
+            or self.vllm_config.cache_config.cache_dtype == "nvfp4_ds_mla"
+        )
 
         self.token_to_req_indices = torch.zeros(
             self.vllm_config.scheduler_config.max_num_batched_tokens,
