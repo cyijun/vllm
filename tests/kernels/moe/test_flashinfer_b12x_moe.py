@@ -72,6 +72,36 @@ def _process_b12x_weights(
     experts.process_weights_after_loading(layer)
 
 
+def test_flashinfer_b12x_wrapper_receives_swiglu_limit(monkeypatch):
+    captured = {}
+
+    class FakeB12xMoEWrapper:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("flashinfer.fused_moe.B12xMoEWrapper", FakeB12xMoEWrapper)
+    ones = torch.ones(1, dtype=torch.float32, device="cuda")
+    quant_config = nvfp4_moe_quant_config(
+        g1_alphas=ones,
+        g2_alphas=ones,
+        a1_gscale=ones,
+        a2_gscale=ones,
+        w1_scale=ones,
+        w2_scale=ones,
+    )
+    moe_config = make_dummy_moe_config(
+        hidden_dim=256,
+        intermediate_size=128,
+        swiglu_limit=10.0,
+    )
+    experts = FlashInferB12xExperts(moe_config, quant_config)
+
+    experts._ensure_wrapper()
+
+    assert captured["activation"] == "silu"
+    assert captured["swiglu_limit"] == 10.0
+
+
 @pytest.mark.parametrize("m,n,k", MNK_FACTORS)
 @pytest.mark.parametrize("e", [8, 16])
 @pytest.mark.parametrize("topk", [1, 2, 4])

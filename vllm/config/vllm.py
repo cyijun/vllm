@@ -2312,12 +2312,19 @@ class VllmConfig:
     def validate_nvfp4_kv_cache_with_mla(self) -> "VllmConfig":
         if self.model_config is None:
             return self
-        if self.cache_config.cache_dtype == "nvfp4" and self.model_config.use_mla:
-            raise ValueError(
-                "nvfp4 KV cache is not supported with MLA (Multi-head Latent "
-                "Attention) backends. Please use a different --kv-cache-dtype "
-                "(e.g., 'fp8' or 'auto') for MLA models such as DeepSeek."
-            )
+        cache_dtype = self.cache_config.cache_dtype
+        is_deepseek_v4_mla = (
+            self.model_config.use_mla
+            and self.model_config.hf_config.model_type == "deepseek_v4"
+        )
+        if cache_dtype == "nvfp4" and self.model_config.use_mla:
+            if not is_deepseek_v4_mla:
+                raise ValueError(
+                    "nvfp4 KV cache with MLA is only supported for DeepSeek V4."
+                )
+            self.cache_config.cache_dtype = "nvfp4_ds_mla"
+        elif cache_dtype == "nvfp4_ds_mla" and not is_deepseek_v4_mla:
+            raise ValueError("nvfp4_ds_mla is only supported for DeepSeek V4 MLA.")
         return self
 
     @model_validator(mode="after")

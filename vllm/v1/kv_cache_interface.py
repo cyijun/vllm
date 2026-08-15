@@ -73,7 +73,7 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
         return KVQuantMode.INT8_PER_TOKEN_HEAD
     if kv_cache_dtype == "fp8_per_token_head":
         return KVQuantMode.FP8_PER_TOKEN_HEAD
-    if kv_cache_dtype == "nvfp4":
+    if kv_cache_dtype in ("nvfp4", "nvfp4_ds_mla"):
         return KVQuantMode.NVFP4
     if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("turboquant_"):
         return KVQuantMode.TURBOQUANT
@@ -406,6 +406,10 @@ class MLAAttentionSpec(FullAttentionSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
+        if self.cache_dtype_str == "nvfp4_ds_mla":
+            if self.model_version != "deepseek_v4":
+                raise ValueError("nvfp4_ds_mla is only defined for DeepSeek V4")
+            return self.storage_block_size * 288
         if self.cache_dtype_str == "fp8_ds_mla":
             if self.model_version == "deepseek_v4":
                 # DeepseekV4: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token.
@@ -646,6 +650,11 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
+        if (
+            self.model_version == "deepseek_v4"
+            and self.cache_dtype_str == "nvfp4_ds_mla"
+        ):
+            return self.storage_block_size * 288
         if self.model_version == "deepseek_v4" and self.cache_dtype_str == "fp8_ds_mla":
             # DeepseekV4 FlashMLA: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B
             # per token. FlashInfer's contiguous bf16/fp8 cache falls through to
@@ -688,6 +697,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
             dtype=specs[0].dtype,
+            kv_quant_mode=specs[0].kv_quant_mode,
             page_size_padded=specs[0].page_size_padded,
             indexes_kv_by_block_stride=block_stride_set.pop(),
             sliding_window=sliding_window_set.pop(),

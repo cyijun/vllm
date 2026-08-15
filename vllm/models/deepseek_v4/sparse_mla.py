@@ -22,7 +22,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_mapping
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
-from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
 
 # Pad C128A topk width to this alignment. 128 covers both h_q=64 (B_TOPK=64) and
 # h_q=128 (B_TOPK=128). FlashMLA decode asserts extra_topk % B_TOPK == 0;
@@ -135,6 +135,16 @@ class DeepseekV4FlashMLAMetadataBuilder(
     AttentionMetadataBuilder[DeepseekV4FlashMLAMetadata]
 ):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+
+    @classmethod
+    def get_cudagraph_support(
+        cls,
+        vllm_config: VllmConfig,
+        kv_cache_spec: KVCacheSpec,
+    ) -> AttentionCGSupport:
+        if getattr(kv_cache_spec, "cache_dtype_str", None) == "nvfp4_ds_mla":
+            return AttentionCGSupport.NEVER
+        return super().get_cudagraph_support(vllm_config, kv_cache_spec)
 
     def __init__(
         self,

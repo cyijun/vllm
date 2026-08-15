@@ -71,3 +71,20 @@ def deep_gemm_fp8_o_proj(
         recipe=einsum_recipe,
     )
     return wo_b(z.flatten(1))
+
+
+def b12x_bf16_o_proj(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    rotary_emb: nn.Module,
+    wo_a: nn.Module,
+    wo_b: nn.Module,
+    *,
+    n_groups: int,
+) -> torch.Tensor:
+    """Portable SM12x output projection for the grouped wo_a BMM."""
+    o, _ = rotary_emb.forward_native(positions, o, None, inverse=True)
+    grouped_o = o.view(o.shape[0], n_groups, -1).transpose(0, 1)
+    assert wo_a.weight.ndim == 3
+    z = torch.bmm(grouped_o, wo_a.weight.transpose(1, 2)).transpose(0, 1)
+    return wo_b(z.flatten(1))

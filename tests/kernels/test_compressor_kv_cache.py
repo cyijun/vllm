@@ -19,6 +19,9 @@ import pytest
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.model_executor.layers.sparse_attn_indexer import (
+    _fp8_paged_mqa_logits_fallback,
+)
 from vllm.models.deepseek_v4.common.ops import (
     compute_global_topk_indices_and_lens,
     dequantize_and_gather_k_cache,
@@ -28,8 +31,14 @@ from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
     _fused_kv_compress_norm_rope_insert_indexer_attn,
     _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn,
     _launch_two_stage_sparse_attn_compressor,
+    compress_norm_rope_store_triton,
 )
 from vllm.models.deepseek_v4.compressor import _get_c128_boundary
+from vllm.models.deepseek_v4.nvidia.ops.nvfp4_mla import (
+    _gather_dequant_nvfp4_rows,
+    nvfp4_mla_sparse_attention,
+    store_nvfp4_mla_cache,
+)
 from vllm.platforms import current_platform
 
 from .test_fused_indexer_q_rope_quant import quantize_to_mxfp4
@@ -95,6 +104,185 @@ def test_get_c128_boundary(starts, query_start_loc, expected):
         query_start_loc_cpu=torch.tensor(query_start_loc),
     )
     assert _get_c128_boundary(metadata) is expected
+
+
+def test_nvfp4_mla_sparse_attention_matches_dequantized_cache():
+    torch.manual_seed(11)
+    backing = torch.zeros(5, 256, 288, dtype=torch.uint8, device="cuda")
+    cache = backing[1:]
+    kv = torch.randn(4, 512, dtype=torch.bfloat16, device="cuda") * 3
+    slots = torch.tensor([0, 257, 513, 769], dtype=torch.int64, device="cuda")
+    store_nvfp4_mla_cache(kv, slots, cache)
+
+    indices = torch.tensor(
+        [[0, 257, -1], [513, 769, -1]], dtype=torch.int32, device="cuda"
+    )
+    lengths = torch.tensor([2, 2], dtype=torch.int32, device="cuda")
+    query = torch.randn(2, 3, 512, dtype=torch.bfloat16, device="cuda")
+    output = torch.empty_like(query)
+    nvfp4_mla_sparse_attention(
+        query,
+        cache,
+        indices,
+        lengths,
+        output,
+        sm_scale=512**-0.5,
+    )
+
+    dequant = _gather_dequant_nvfp4_rows(cache, indices).float()
+    valid = indices >= 0
+    scores = torch.einsum("thd,tkd->thk", query.float(), dequant) * 512**-0.5
+    scores.masked_fill_(~valid[:, None, :], float("-inf"))
+    weights = torch.softmax(scores, dim=-1).masked_fill(~valid[:, None, :], 0)
+    expected = torch.einsum("thk,tkd->thd", weights, dequant).to(output.dtype)
+
+    torch.testing.assert_close(output, expected, rtol=1e-3, atol=1e-3)
+
+
+def test_fp8_paged_mqa_logits_fallback_matches_quantized_cache():
+    batch_size, num_heads, head_dim = 2, 3, 128
+    block_size = 16
+    context_lens = torch.tensor([[5], [7]], dtype=torch.int32, device="cuda")
+    block_table = torch.tensor([[0], [1]], dtype=torch.int32, device="cuda")
+    kv_cache = torch.zeros(
+        2, block_size, head_dim + 4, dtype=torch.uint8, device="cuda"
+    )
+    k = torch.randn(12, head_dim, dtype=torch.bfloat16, device="cuda")
+    slots = torch.cat(
+        (
+            torch.arange(5, dtype=torch.int64, device="cuda"),
+            torch.arange(7, dtype=torch.int64, device="cuda") + block_size,
+        )
+    )
+    ops.indexer_k_quant_and_cache(k, kv_cache, slots, head_dim, "ue8m0")
+
+    q = torch.randn(
+        batch_size, 1, num_heads, head_dim, dtype=torch.bfloat16, device="cuda"
+    ).to(torch.float8_e4m3fn)
+    weights = torch.randn(batch_size, num_heads, dtype=torch.float32, device="cuda")
+    actual = _fp8_paged_mqa_logits_fallback(
+        q, kv_cache, weights, context_lens, block_table, head_dim, 16
+    )
+
+    cu_seq_lens = torch.tensor([0, 5, 12], dtype=torch.int32, device="cuda")
+    gathered = torch.empty(12, head_dim, dtype=torch.uint8, device="cuda")
+    scale_bytes = torch.empty(12, 4, dtype=torch.uint8, device="cuda")
+    ops.cp_gather_indexer_k_quant_cache(
+        kv_cache, gathered, scale_bytes, block_table, cu_seq_lens
+    )
+    gathered = gathered.view(torch.float8_e4m3fn).float()
+    scales = scale_bytes.view(torch.float32).reshape(-1)
+    expected = torch.full_like(actual, float("-inf"))
+    for batch_idx, (start, end) in enumerate(((0, 5), (5, 12))):
+        scores = torch.einsum("hd,nd->hn", q[batch_idx, 0].float(), gathered[start:end])
+        expected[batch_idx, : end - start] = (
+            scores.relu() * weights[batch_idx, :, None]
+        ).sum(dim=0) * scales[start:end]
+
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("compress_ratio", [4, 128])
+def test_nvfp4_mla_compressor(compress_ratio: int):
+    head_dim = 512
+    rope_dim = 64
+    state_block_size = 8 if compress_ratio == 128 else 16
+    kv_block_size = 16
+    num_tokens = 2
+    overlap = int(compress_ratio == 4)
+    state_width = (1 + overlap) * head_dim
+    num_pages = (compress_ratio * num_tokens - 1) // state_block_size + 2
+
+    torch.manual_seed(19)
+    state_cache = torch.randn(
+        num_pages,
+        state_block_size,
+        2 * state_width,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    block_table = torch.arange(num_pages, dtype=torch.int32, device="cuda").unsqueeze(0)
+    token_to_req = torch.zeros(num_tokens, dtype=torch.int32, device="cuda")
+    slots = torch.arange(num_tokens, dtype=torch.int64, device="cuda")
+    positions = torch.arange(
+        compress_ratio - 1,
+        compress_ratio * num_tokens,
+        compress_ratio,
+        dtype=torch.int64,
+        device="cuda",
+    )
+    rms_weight = torch.randn(head_dim, dtype=torch.bfloat16, device="cuda")
+    cos_sin_cache = torch.randn(
+        compress_ratio * num_tokens,
+        rope_dim,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    kv_cache = torch.zeros(2, kv_block_size, 288, dtype=torch.uint8, device="cuda")
+    scratch = torch.empty(num_tokens, head_dim, dtype=torch.float32, device="cuda")
+
+    args = (
+        state_cache,
+        token_to_req,
+        positions,
+        slots,
+        block_table,
+        state_block_size,
+        state_width,
+        compress_ratio,
+        cos_sin_cache,
+        kv_cache,
+        slots,
+        rms_weight,
+        1e-6,
+        16,
+        256,
+        32,
+        head_dim,
+        rope_dim,
+        num_tokens,
+    )
+    if compress_ratio == 4:
+        compress_norm_rope_store_triton(
+            state_cache,
+            num_tokens,
+            token_to_req,
+            positions,
+            slots,
+            block_table,
+            state_block_size,
+            state_width,
+            cos_sin_cache,
+            kv_cache,
+            SimpleNamespace(slot_mapping=slots),
+            {},
+            head_dim,
+            rope_dim,
+            compress_ratio,
+            bool(overlap),
+            True,
+            rms_weight,
+            1e-6,
+            16,
+            256,
+            32,
+        )
+    else:
+        _launch_two_stage_sparse_attn_compressor(*args, scratch, use_fp4_cache=True)
+
+    expected = _reference_kv_compress_norm_rope(
+        state_cache,
+        block_table,
+        positions,
+        rms_weight,
+        cos_sin_cache,
+        compress_ratio,
+        overlap,
+        rms_eps=1e-6,
+        return_full_cache=True,
+    )
+    actual = _gather_dequant_nvfp4_rows(kv_cache, slots[None]).squeeze(0)
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=0.3, atol=0.75)
 
 
 # ── Test A: DeepseekV4 Attention path ──────────────────────────────────────────────

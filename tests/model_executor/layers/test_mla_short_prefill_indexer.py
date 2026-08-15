@@ -14,6 +14,34 @@ INDEXER_LAYER = "model.layers.0.self_attn.indexer.k_cache"
 MLA_LAYER = "model.layers.0.self_attn.attn"
 
 
+def test_fp8_mqa_logits_fallback_applies_scales_weights_and_mask():
+    q = torch.tensor(
+        [
+            [[1.0, -2.0], [0.5, 1.0]],
+            [[-1.0, 0.25], [2.0, -0.5]],
+        ]
+    )
+    k = torch.tensor([[1.0, 2.0], [-0.5, 1.0], [2.0, -1.0]])
+    scales = torch.tensor([0.5, 2.0, 0.25], dtype=torch.float32)
+    scale_bytes = scales.view(torch.uint8).reshape(-1, 4)
+    weights = torch.tensor([[0.25, 0.75], [1.5, -0.5]])
+    starts = torch.tensor([0, 1], dtype=torch.int32)
+    ends = torch.tensor([2, 3], dtype=torch.int32)
+
+    actual = sparse_indexer._fp8_mqa_logits_fallback(
+        q, k, scale_bytes, weights, starts, ends
+    )
+    scores = torch.einsum("mhd,nd->mhn", q, k * scales[:, None])
+    expected = (scores.relu() * weights[:, :, None]).sum(dim=1)
+    positions = torch.arange(k.shape[0])
+    valid = (positions[None, :] >= starts[:, None]) & (
+        positions[None, :] < ends[:, None]
+    )
+    expected.masked_fill_(~valid, float("-inf"))
+
+    torch.testing.assert_close(actual, expected)
+
+
 def make_indexer_metadata(
     *,
     num_decodes: int = 0,

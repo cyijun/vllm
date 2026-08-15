@@ -87,6 +87,8 @@ class CompressorBackend(AttentionBackend):
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
         assert num_kv_heads == 1
+        if cache_dtype_str == "nvfp4_ds_mla":
+            return (num_blocks, block_size, 288)
         return (num_blocks, block_size, head_size)
 
     @staticmethod
@@ -117,6 +119,7 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
         assert isinstance(self.kv_cache_spec, SlidingWindowMLASpec | MLAAttentionSpec)
         mla_spec = cast(SlidingWindowMLASpec | MLAAttentionSpec, self.kv_cache_spec)
         self.block_size = mla_spec.block_size
+        self.use_fp4_cache = mla_spec.cache_dtype_str == "nvfp4_ds_mla"
 
         self.token_to_req_indices = torch.zeros(
             self.vllm_config.scheduler_config.max_num_batched_tokens,
@@ -134,7 +137,7 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
             self.token_to_req_indices
         )
         num_decode_tokens = None
-        if _prefer_two_stage_compressor():
+        if _prefer_two_stage_compressor() or self.use_fp4_cache:
             _, _, num_decode_tokens, _ = split_decodes_and_prefills(
                 common_attn_metadata, decode_threshold=1
             )
@@ -192,14 +195,22 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
         # fp8_ds_mla is the UE8M0 paged layout and needs 576B alignment. Plain
         # full-cache rows share state pages with contiguous KV pages, so padding
         # would break page matching.
-        uses_fp8_ds_mla_layout = vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
+        cache_dtype = vllm_config.cache_config.cache_dtype
+        uses_fp8_ds_mla_layout = cache_dtype == "fp8_ds_mla"
+        uses_nvfp4_ds_mla_layout = cache_dtype == "nvfp4_ds_mla"
         return SlidingWindowMLASpec(  # only has one vector instead of K + V
             block_size=self.block_size,
             num_kv_heads=1,
             head_size=self.state_dim,
             dtype=self.dtype,
             sliding_window=self.sliding_window,
-            alignment=576 if uses_fp8_ds_mla_layout else 512,
+            alignment=(
+                288
+                if uses_nvfp4_ds_mla_layout
+                else 576
+                if uses_fp8_ds_mla_layout
+                else 512
+            ),
         )
 
     def forward(self): ...
@@ -255,9 +266,13 @@ class DeepseekCompressor(nn.Module):
         # The head=512 cr>=128 no-overlap deep gather uses the two-stage
         # compressor, which needs an fp32 scratch [max_batched, 512] for
         # the intermediate compressed_kv.
-        # Currently only tested on ROCm
         self._use_two_stage_fused_compressor = (
-            _prefer_two_stage_compressor() and head_dim == 512 and not self.overlap
+            (
+                _prefer_two_stage_compressor()
+                or (use_fp4_cache and self.compress_ratio >= 128)
+            )
+            and head_dim == 512
+            and not self.overlap
         )
         self.max_num_batched_tokens = (
             vllm_config.scheduler_config.max_num_batched_tokens
@@ -306,12 +321,14 @@ class DeepseekCompressor(nn.Module):
         )
 
         if self.head_dim == 512:
-            assert not use_fp4_cache, (
-                "MXFP4 cache is only supported for indexer (head=128)"
-            )
-            self._quant_block = 64
-            self._token_stride = self.nope_head_dim + self.rope_head_dim * 2
-            self._scale_dim = self.nope_head_dim // 64 + 1  # 7 real + 1 pad
+            if use_fp4_cache:
+                self._quant_block = 16
+                self._token_stride = self.head_dim // 2
+                self._scale_dim = self.head_dim // self._quant_block
+            else:
+                self._quant_block = 64
+                self._token_stride = self.nope_head_dim + self.rope_head_dim * 2
+                self._scale_dim = self.nope_head_dim // 64 + 1  # 7 real + 1 pad
         elif self.head_dim == 128:
             if use_fp4_cache:
                 self._quant_block = MXFP4_BLOCK_SIZE
@@ -419,7 +436,22 @@ class DeepseekCompressor(nn.Module):
         # cutedsl (head=512) accepts the full-cache flags; triton (indexer/AMD)
         # does not, so the two callables have different signatures.
         compress_norm_rope_store_fn: Any
-        if current_platform.is_cuda() and self.head_dim == 512:
+        extra_kwargs: dict[str, Any]
+        if self._use_two_stage_fused_compressor:
+            # The C128 gather is too large for the one-program Triton kernel on
+            # SM12x. Split it across the head dimension before the common
+            # normalize, RoPE, and cache-store stage.
+            assert state_metadata.num_decode_tokens is not None
+            assert self._compress_scratch is not None
+            compress_norm_rope_store_fn = compress_norm_rope_store_two_stage_triton
+            extra_kwargs = {
+                "num_decode_tokens": state_metadata.num_decode_tokens,
+                "compress_scratch": self._compress_scratch,
+            }
+        elif self.use_fp4_cache:
+            compress_norm_rope_store_fn = compress_norm_rope_store_triton
+            extra_kwargs = {}
+        elif current_platform.is_cuda() and self.head_dim == 512:
             from .nvidia.ops.sparse_attn_compress_cutedsl import (
                 compress_norm_rope_store_cutedsl,
             )
@@ -428,7 +460,7 @@ class DeepseekCompressor(nn.Module):
             # layout and the plain full-cache layout. The full-cache flags
             # are consumed only here.
             compress_norm_rope_store_fn = compress_norm_rope_store_cutedsl
-            extra_kwargs: dict[str, Any] = dict(
+            extra_kwargs = dict(
                 store_full_kv=store_full_kv,
                 store_full_fp8=store_full_fp8,
                 fp8_scale=fp8_scale,
@@ -437,15 +469,6 @@ class DeepseekCompressor(nn.Module):
                 extra_kwargs["compress_scratch"] = (
                     self.eager_scratch_pool.compressor_scratch(num_actual)
                 )
-        elif self._use_two_stage_fused_compressor:
-            # head=512 cr>=128 (no overlap): two-pass split compressor on the
-            # prefill suffix, single-pass on the decode prefix.
-            assert state_metadata.num_decode_tokens is not None
-            compress_norm_rope_store_fn = compress_norm_rope_store_two_stage_triton
-            extra_kwargs = {
-                "num_decode_tokens": state_metadata.num_decode_tokens,
-                "compress_scratch": self._compress_scratch,
-            }
         else:
             # Indexer path (head_dim == 128) or non-CUDA GPUs (AMD, XPU, etc.).
             compress_norm_rope_store_fn = compress_norm_rope_store_triton

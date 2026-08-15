@@ -163,6 +163,9 @@ from vllm.model_executor.kernels.linear.scaled_mm.aiter import (
     AiterPerTokenFp8ScaledMMLinearKernel,
     AiterPreshuffledPerTokenFp8ScaledMMLinearKernel,
 )
+from vllm.model_executor.kernels.linear.scaled_mm.b12x_block import (
+    B12xFp8BlockScaledMMKernel,
+)
 from vllm.model_executor.kernels.linear.scaled_mm.cpu import (
     CPUFp8BlockScaledMMKernel,
     CPUInt8ScaledMMLinearKernel,
@@ -374,6 +377,7 @@ _POSSIBLE_FP8_BLOCK_KERNELS: dict[
     PlatformEnum.CUDA: [
         FlashInferFp8DeepGEMMDynamicBlockScaledKernel,
         DeepGemmFp8BlockScaledMMKernel,
+        B12xFp8BlockScaledMMKernel,
         CutlassFp8BlockScaledMMKernel,
         MarlinFP8ScaledMMLinearKernel,
         TritonFp8BlockScaledMMKernel,

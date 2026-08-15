@@ -464,6 +464,8 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         vllm_config: VllmConfig,
         kv_cache_spec: KVCacheSpec,
     ) -> AttentionCGSupport:
+        if current_platform.is_cuda() and not has_deep_gemm():
+            return AttentionCGSupport.NEVER
         return AttentionCGSupport.UNIFORM_BATCH
 
     def __init__(self, *args, block_table_width: int, **kwargs) -> None:

@@ -59,6 +59,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
     get_kv_cache_spec_sliding_window,
+    get_kv_quant_mode,
 )
 from vllm.v1.metrics.stats import CachingMetrics, PrefixCacheStats
 from vllm.v1.request import Request
@@ -2115,6 +2116,50 @@ def new_swa_mla_spec(head_size=576, sliding_window=128):
         dtype=torch.float32,
         sliding_window=sliding_window,
     )
+
+
+def test_deepseek_v4_nvfp4_mla_page_size_and_merge():
+    from vllm.models.deepseek_v4.sparse_mla import (
+        DeepseekV4FlashMLAMetadataBuilder,
+    )
+    from vllm.v1.attention.backend import AttentionCGSupport
+
+    quant_mode = get_kv_quant_mode("nvfp4_ds_mla")
+    assert quant_mode == KVQuantMode.NVFP4
+
+    full_spec = MLAAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        cache_dtype_str="nvfp4_ds_mla",
+        alignment=288,
+        model_version="deepseek_v4",
+        kv_quant_mode=quant_mode,
+    )
+    swa_spec = SlidingWindowMLASpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        sliding_window=4096,
+        cache_dtype_str="nvfp4_ds_mla",
+        alignment=288,
+        model_version="deepseek_v4",
+        kv_quant_mode=quant_mode,
+    )
+
+    assert full_spec.real_page_size_bytes == 16 * 288
+    assert (
+        DeepseekV4FlashMLAMetadataBuilder.get_cudagraph_support(
+            SimpleNamespace(), full_spec
+        )
+        == AttentionCGSupport.NEVER
+    )
+    assert swa_spec.real_page_size_bytes == 16 * 288
+    merged = SlidingWindowMLASpec.merge([swa_spec, swa_spec])
+    assert merged.kv_quant_mode == KVQuantMode.NVFP4
+    assert merged.real_page_size_bytes == 16 * 288
 
 
 def test_group_and_unify_kv_cache_specs_no_swa_mla_returns_none():

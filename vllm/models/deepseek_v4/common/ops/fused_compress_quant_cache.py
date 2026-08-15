@@ -58,15 +58,16 @@ def compress_norm_rope_store_triton(
     Picks one of the three kernels in this module based on ``head_dim`` and
     ``use_fp4_cache``. Identical launch signature for all three.
     """
-    if head_dim == 512:
+    if use_fp4_cache:
+        kernel = _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn
+        num_warps = 4 if head_dim == 512 else 1
+    elif head_dim == 512:
         kernel = _fused_kv_compress_norm_rope_insert_sparse_attn
         num_warps = 4
-    elif use_fp4_cache:
-        kernel = _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn
-        num_warps = 1
     else:
         kernel = _fused_kv_compress_norm_rope_insert_indexer_attn
         num_warps = 1
+    fp4_kwargs = {"NVFP4_SCALE": head_dim == 512} if use_fp4_cache else {}
 
     kernel[(num_actual,)](
         # state cache
@@ -103,6 +104,7 @@ def compress_norm_rope_store_triton(
         SCALE_DIM=scale_dim,
         KV_BLOCK_STRIDE=kv_cache.stride(0),
         num_warps=num_warps,
+        **fp4_kwargs,
         **pdl_kwargs,
     )
 
@@ -417,6 +419,7 @@ def _finalize_norm_rope_quant_store_sparse_attn(
     TOKEN_STRIDE: tl.constexpr,
     SCALE_DIM: tl.constexpr,
     KV_BLOCK_STRIDE: tl.constexpr,
+    NVFP4_SCALE: tl.constexpr = False,
 ):
     """Stage 2: read compressed_kv[512] from scratch buffer, then
     RMSNorm + FP8 quant (nope) + RoPE + bf16 store
@@ -459,27 +462,6 @@ def _finalize_norm_rope_quant_store_sparse_attn(
     N_NOPE_BLOCKS: tl.constexpr = NOPE_HEAD_DIM // QUANT_BLOCK
     INV_FP8_MAX: tl.constexpr = 1.0 / FP8_MAX
 
-    quant_input = normed.to(tl.bfloat16).to(tl.float32)
-    quant_2d = tl.reshape(quant_input, (N_QUANT_BLOCKS, QUANT_BLOCK))
-    block_absmax = tl.maximum(tl.max(tl.abs(quant_2d), axis=1), 1e-4)
-    raw_scales = block_absmax * INV_FP8_MAX
-    exponents = tl.ceil(tl.log2(raw_scales))
-    inv_scales = tl.exp2(-exponents)
-    x_scaled = quant_2d * tl.reshape(inv_scales, (N_QUANT_BLOCKS, 1))
-    x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
-    x_uint8 = tl.reshape(
-        x_clamped.to(tl.float8e4nv).to(tl.uint8, bitcast=True),
-        (TRITON_BLOCK_SIZE,),
-    )
-    tl.store(fp8_ptr + block, x_uint8, mask=block < NOPE_HEAD_DIM)
-
-    scale_idx = tl.arange(0, N_QUANT_BLOCKS)
-    encoded = tl.maximum(tl.minimum(exponents + 127.0, 255.0), 0.0)
-    tl.store(
-        scale_ptr + scale_idx, encoded.to(tl.uint8), mask=scale_idx < N_NOPE_BLOCKS
-    )
-    tl.store(scale_ptr + N_NOPE_BLOCKS, tl.zeros((), dtype=tl.uint8))
-
     NUM_PAIRS: tl.constexpr = TRITON_BLOCK_SIZE // 2
     NOPE_PAIRS: tl.constexpr = NOPE_HEAD_DIM // 2
     even, odd = tl.split(tl.reshape(normed, (NUM_PAIRS, 2)))
@@ -494,10 +476,53 @@ def _finalize_norm_rope_quant_store_sparse_attn(
     new_even = even * cos_v - odd * sin_v
     new_odd = odd * cos_v + even * sin_v
     result = tl.interleave(new_even, new_odd)
-    bf16_ptr = (fp8_ptr + NOPE_HEAD_DIM).to(tl.pointer_type(tl.bfloat16))
-    rope_local = block - NOPE_HEAD_DIM
-    is_rope = (block >= NOPE_HEAD_DIM) & mask
-    tl.store(bf16_ptr + rope_local, result.to(tl.bfloat16), mask=is_rope)
+    scale_idx = tl.arange(0, N_QUANT_BLOCKS)
+
+    if NVFP4_SCALE:
+        quant_input = result.to(tl.bfloat16).to(tl.float32)
+        quant_pairs = tl.reshape(quant_input, (N_QUANT_BLOCKS, QUANT_BLOCK // 2, 2))
+        quant_even, quant_odd = tl.split(quant_pairs)
+        block_absmax = tl.maximum(
+            tl.max(tl.abs(quant_even), axis=1),
+            tl.max(tl.abs(quant_odd), axis=1),
+        )
+        scale = tl.maximum(block_absmax * (1.0 / 6.0), 2**-9)
+        scale_fp8 = scale.to(tl.float8e4nv)
+        inv_scale = tl.reshape(1.0 / scale_fp8.to(tl.float32), (N_QUANT_BLOCKS, 1))
+        packed = _fp32x2_to_fp4x2(quant_even * inv_scale, quant_odd * inv_scale)
+        tl.store(
+            fp8_ptr + tl.arange(0, TOKEN_STRIDE),
+            tl.reshape(packed, (TOKEN_STRIDE,)),
+        )
+        tl.store(
+            scale_ptr + scale_idx,
+            scale_fp8.to(tl.uint8, bitcast=True),
+        )
+    else:
+        quant_input = normed.to(tl.bfloat16).to(tl.float32)
+        quant_2d = tl.reshape(quant_input, (N_QUANT_BLOCKS, QUANT_BLOCK))
+        block_absmax = tl.maximum(tl.max(tl.abs(quant_2d), axis=1), 1e-4)
+        raw_scales = block_absmax * INV_FP8_MAX
+        exponents = tl.ceil(tl.log2(raw_scales))
+        inv_scales = tl.exp2(-exponents)
+        x_scaled = quant_2d * tl.reshape(inv_scales, (N_QUANT_BLOCKS, 1))
+        x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
+        x_uint8 = tl.reshape(
+            x_clamped.to(tl.float8e4nv).to(tl.uint8, bitcast=True),
+            (TRITON_BLOCK_SIZE,),
+        )
+        tl.store(fp8_ptr + block, x_uint8, mask=block < NOPE_HEAD_DIM)
+        encoded = tl.maximum(tl.minimum(exponents + 127.0, 255.0), 0.0)
+        tl.store(
+            scale_ptr + scale_idx,
+            encoded.to(tl.uint8),
+            mask=scale_idx < N_NOPE_BLOCKS,
+        )
+        tl.store(scale_ptr + N_NOPE_BLOCKS, tl.zeros((), dtype=tl.uint8))
+        bf16_ptr = (fp8_ptr + NOPE_HEAD_DIM).to(tl.pointer_type(tl.bfloat16))
+        rope_local = block - NOPE_HEAD_DIM
+        is_rope = (block >= NOPE_HEAD_DIM) & mask
+        tl.store(bf16_ptr + rope_local, result.to(tl.bfloat16), mask=is_rope)
 
 
 def _launch_two_stage_sparse_attn_compressor(
@@ -521,6 +546,7 @@ def _launch_two_stage_sparse_attn_compressor(
     rope_head_dim: int,
     num_actual: int,
     compress_scratch: torch.Tensor,
+    use_fp4_cache: bool = False,
 ) -> None:
     num_splits = _pick_compress_num_splits(num_actual, compress_ratio, head_dim)
     head_tile = head_dim // num_splits
@@ -564,6 +590,7 @@ def _launch_two_stage_sparse_attn_compressor(
         TOKEN_STRIDE=token_stride,
         SCALE_DIM=scale_dim,
         KV_BLOCK_STRIDE=kv_cache.stride(0),
+        NVFP4_SCALE=use_fp4_cache,
     )
 
 
@@ -599,7 +626,7 @@ def compress_norm_rope_store_two_stage_triton(
     to fill the CUs, and use the original single-pass launcher
     for decode [0, num_decode_tokens)
     """
-    num_decodes = min(max(num_decode_tokens, 0), num_actual)
+    num_decodes = 0 if use_fp4_cache else min(max(num_decode_tokens, 0), num_actual)
     num_prefills = num_actual - num_decodes
     if num_prefills > 0:
         _launch_two_stage_sparse_attn_compressor(
@@ -623,6 +650,7 @@ def compress_norm_rope_store_two_stage_triton(
             rope_head_dim=rope_head_dim,
             num_actual=num_prefills,
             compress_scratch=compress_scratch,
+            use_fp4_cache=use_fp4_cache,
         )
     if num_decodes > 0:
         compress_norm_rope_store_triton(
@@ -866,6 +894,7 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
     TOKEN_STRIDE: tl.constexpr,  # HEAD_SIZE // 2 = 64 packed bytes/token
     SCALE_DIM: tl.constexpr,  # HEAD_SIZE // QUANT_BLOCK = 4 ue8m0 bytes/token
     KV_BLOCK_STRIDE: tl.constexpr,
+    NVFP4_SCALE: tl.constexpr = False,
 ):
     """Fused compress → RMSNorm → RoPE → MXFP4 quant → store.
 
@@ -1005,11 +1034,16 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
     )
     amax = tl.maximum(amax, 6.0 * (2**-126))
 
-    # ue8m0 block scale: 2^ceil(log2(amax / 6.0)), stored as (exp + 127) byte.
-    log2_ratio = tl.ceil(tl.log2(amax * (1.0 / 6.0)))
-    log2_ratio = tl.minimum(tl.maximum(log2_ratio, -127.0), 127.0)
-    inv_scale = tl.exp2(-log2_ratio)
-    ue8m0 = (log2_ratio + 127.0).to(tl.uint8)  # [N_QUANT_BLOCKS]
+    if NVFP4_SCALE:
+        scale = tl.maximum(amax * (1.0 / 6.0), 2**-9)
+        scale_fp8 = scale.to(tl.float8e4nv)
+        inv_scale = 1.0 / scale_fp8.to(tl.float32)
+        stored_scale = scale_fp8.to(tl.uint8, bitcast=True)
+    else:
+        log2_ratio = tl.ceil(tl.log2(amax * (1.0 / 6.0)))
+        log2_ratio = tl.minimum(tl.maximum(log2_ratio, -127.0), 127.0)
+        inv_scale = tl.exp2(-log2_ratio)
+        stored_scale = (log2_ratio + 127.0).to(tl.uint8)
 
     inv_scale_col = tl.reshape(inv_scale, (N_QUANT_BLOCKS, 1))
     packed = _fp32x2_to_fp4x2(
@@ -1018,4 +1052,4 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
     packed_flat = tl.reshape(packed, (TOKEN_STRIDE,))
 
     tl.store(val_ptr + tl.arange(0, TOKEN_STRIDE), packed_flat)
-    tl.store(scale_ptr + tl.arange(0, SCALE_DIM), ue8m0)
+    tl.store(scale_ptr + tl.arange(0, SCALE_DIM), stored_scale)

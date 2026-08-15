@@ -14,6 +14,7 @@ from vllm.models.deepseek_v4.common.ops import (
     compute_global_topk_indices_and_lens,
 )
 from vllm.models.deepseek_v4.nvidia.ops.o_proj import (
+    b12x_bf16_o_proj,
     compute_fp8_einsum_recipe,
     deep_gemm_fp8_o_proj,
 )
@@ -88,6 +89,7 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4FlashMLABackend):
         "fp8",
         "fp8_e4m3",
         "fp8_ds_mla",
+        "nvfp4_ds_mla",
     ]
 
     @staticmethod
@@ -137,7 +139,12 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4FlashMLABackend):
                 return "kv_cache_dtype not supported"
             return None
         if device_capability.major == 12:
-            if kv_cache_dtype not in ("fp8", "fp8_e4m3", "fp8_ds_mla"):
+            if kv_cache_dtype not in (
+                "fp8",
+                "fp8_e4m3",
+                "fp8_ds_mla",
+                "nvfp4_ds_mla",
+            ):
                 return "kv_cache_dtype not supported"
             from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120
 
@@ -158,6 +165,8 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4FlashMLABackend):
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
         device_capability = current_platform.get_device_capability()
+        if cache_dtype_str == "nvfp4_ds_mla":
+            return (num_blocks, block_size, 288)
         if device_capability is not None and device_capability.major == 12:
             return DeepseekV4FlashMLABackend.get_kv_cache_shape(
                 num_blocks,
@@ -181,6 +190,15 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
         return _pad_to_supported_q_heads(num_heads)
 
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        if getattr(self.wo_a, "b12x_bf16_bmm", False):
+            return b12x_bf16_o_proj(
+                o,
+                positions,
+                self.rotary_emb,
+                self.wo_a,
+                self.wo_b,
+                n_groups=self.n_local_groups,
+            )
         return deep_gemm_fp8_o_proj(
             o,
             positions,
@@ -556,6 +574,15 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         return _pad_to_supported_q_heads(num_heads)
 
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        if getattr(self.wo_a, "b12x_bf16_bmm", False):
+            return b12x_bf16_o_proj(
+                o,
+                positions,
+                self.rotary_emb,
+                self.wo_a,
+                self.wo_b,
+                n_groups=self.n_local_groups,
+            )
         return deep_gemm_fp8_o_proj(
             o,
             positions,
@@ -760,6 +787,25 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         assert swa_indices is not None
         assert swa_lens is not None
         q = self._prepare_query(q, output)
+        if self.kv_cache_dtype == "nvfp4_ds_mla":
+            from vllm.models.deepseek_v4.nvidia.ops.nvfp4_mla import (
+                nvfp4_mla_sparse_attention,
+            )
+
+            nvfp4_mla_sparse_attention(
+                query=q,
+                swa_cache=self.swa_cache_layer.kv_cache,
+                swa_indices=swa_indices,
+                swa_lens=swa_lens,
+                output=output,
+                sm_scale=self.scale,
+                sinks=self.attn_sink,
+                extra_cache=kv_cache,
+                extra_indices=extra_sparse_indices,
+                extra_lens=extra_sparse_lengths,
+            )
+            return
+
         swa_cache = self._as_sparse_cache(self.swa_cache_layer.kv_cache)
         extra_cache = self._as_sparse_cache(kv_cache) if kv_cache is not None else None
         if extra_cache is not None and extra_sparse_indices is None:
@@ -845,7 +891,10 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
         assert swa_metadata.prefill_swa_lens is not None
 
         q = self._prepare_query(q, output)
-        swa_kv_paged = self._as_sparse_cache(swa_k_cache)
+        is_nvfp4_mla = self.kv_cache_dtype == "nvfp4_ds_mla"
+        swa_kv_paged = (
+            swa_k_cache if is_nvfp4_mla else self._as_sparse_cache(swa_k_cache)
+        )
         if swa_only:
             extra_kv_paged = None
         else:
@@ -853,7 +902,11 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 raise RuntimeError(
                     "Compressed sparse MLA layers require their compressed KV cache."
                 )
-            extra_kv_paged = self._as_sparse_cache(compressed_k_cache)
+            extra_kv_paged = (
+                compressed_k_cache
+                if is_nvfp4_mla
+                else self._as_sparse_cache(compressed_k_cache)
+            )
 
         num_chunks = (
             num_prefills + self.PREFILL_CHUNK_SIZE - 1
@@ -882,6 +935,25 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             q_chunk = q[query_start:query_end]
             swa_indices_chunk = swa_metadata.prefill_swa_indices[query_start:query_end]
             swa_lens_chunk = swa_metadata.prefill_swa_lens[query_start:query_end]
+            if self.kv_cache_dtype == "nvfp4_ds_mla":
+                from vllm.models.deepseek_v4.nvidia.ops.nvfp4_mla import (
+                    nvfp4_mla_sparse_attention,
+                )
+
+                nvfp4_mla_sparse_attention(
+                    query=q_chunk,
+                    swa_cache=swa_k_cache,
+                    swa_indices=swa_indices_chunk,
+                    swa_lens=swa_lens_chunk,
+                    output=output[query_start:query_end],
+                    sm_scale=self.scale,
+                    sinks=self.attn_sink,
+                    extra_cache=extra_kv_paged,
+                    extra_indices=extra_sparse_indices_chunk,
+                    extra_lens=extra_sparse_lengths_chunk,
+                )
+                continue
+
             if extra_kv_paged is not None and extra_sparse_indices_chunk is None:
                 raise RuntimeError(
                     "Compressed sparse MLA prefill requires compressed sparse indices."

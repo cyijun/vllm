@@ -56,6 +56,7 @@ def make_dummy_moe_config(
     in_dtype: torch.dtype = torch.bfloat16,
     max_num_tokens: int = 512,
     activation: MoEActivation = MoEActivation.SILU,
+    swiglu_limit: float | None = None,
 ) -> FusedMoEConfig:
     """
     This is a dummy config for the mk constructor interface
@@ -79,6 +80,7 @@ def make_dummy_moe_config(
         device="cuda",
         routing_method=RoutingMethodType.TopK,
         max_num_tokens=max_num_tokens,
+        swiglu_limit=swiglu_limit,
     )
 
 

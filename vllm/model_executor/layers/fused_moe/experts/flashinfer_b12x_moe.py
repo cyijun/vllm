@@ -75,6 +75,7 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
         )
         self.max_num_tokens = moe_config.max_num_tokens
         self.local_expert_offset = self.ep_rank * self.num_local_experts
+        self.swiglu_limit = moe_config.swiglu_limit
 
         activation = moe_config.activation
         if activation not in self._ACTIVATION_MAP:
@@ -243,6 +244,7 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             max_num_tokens=self.max_num_tokens,
             num_local_experts=self.num_local_experts,
             activation=self._activation_str,
+            swiglu_limit=self.swiglu_limit,
         )
 
     def apply(

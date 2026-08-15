@@ -292,6 +292,73 @@ def kv_cache_as_quant_view(
     return kv_cache.unsqueeze(-2)
 
 
+def _fp8_mqa_logits_fallback(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    k_scale: torch.Tensor,
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+) -> torch.Tensor:
+    k_scale = k_scale.view(torch.float32).reshape(-1)
+    scores = torch.einsum("mhd,nd->mhn", q.float(), k.float())
+    logits = (scores.relu() * weights[:, :, None]).sum(dim=1)
+    logits *= k_scale[None, :]
+    positions = torch.arange(k.shape[0], device=k.device)
+    valid = (positions[None, :] >= cu_seqlen_ks[:, None]) & (
+        positions[None, :] < cu_seqlen_ke[:, None]
+    )
+    return logits.masked_fill(~valid, float("-inf"))
+
+
+def _fp8_paged_mqa_logits_fallback(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    head_dim: int,
+    max_model_len: int,
+) -> torch.Tensor:
+    batch_size, next_n = q.shape[:2]
+    context_limits = context_lens[:, None] if context_lens.ndim == 1 else context_lens
+    gather_lens = context_limits.amax(dim=1)
+    cu_seq_lens = torch.cat(
+        (
+            torch.zeros(1, dtype=torch.int32, device=q.device),
+            gather_lens.cumsum(dim=0, dtype=torch.int32),
+        )
+    )
+    total_tokens = int(cu_seq_lens[-1].item())
+    k_quant = torch.empty((total_tokens, head_dim), dtype=torch.uint8, device=q.device)
+    k_scale = torch.empty((total_tokens, 4), dtype=torch.uint8, device=q.device)
+    ops.cp_gather_indexer_k_quant_cache(
+        kv_cache, k_quant, k_scale, block_table, cu_seq_lens
+    )
+    k_quant = k_quant.view(current_platform.fp8_dtype()).float()
+    k_scale = k_scale.view(torch.float32).reshape(-1)
+
+    logits = torch.full(
+        (batch_size * next_n, max_model_len),
+        float("-inf"),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    q = q.float()
+    for batch_idx in range(batch_size):
+        start = int(cu_seq_lens[batch_idx].item())
+        end = int(cu_seq_lens[batch_idx + 1].item())
+        k = k_quant[start:end]
+        scale = k_scale[start:end]
+        for token_idx in range(next_n):
+            context_len = int(context_limits[batch_idx, token_idx].item())
+            scores = torch.einsum("hd,nd->hn", q[batch_idx, token_idx], k)
+            row = batch_idx * next_n + token_idx
+            token_logits = (scores.relu() * weights[row, :, None]).sum(dim=0) * scale
+            logits[row, :context_len] = token_logits[:context_len]
+    return logits
+
+
 @eager_break_during_capture
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
@@ -485,7 +552,20 @@ def sparse_attn_indexer(
                     q_slice_cast = q_slice
                     k_quant_cast = k_quant
                     k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
-                if current_platform.is_xpu():
+                if current_platform.is_cuda() and not has_deep_gemm():
+                    if use_fp4_cache:
+                        raise RuntimeError(
+                            "The CUDA sparse indexer fallback supports FP8 cache only."
+                        )
+                    logits = _fp8_mqa_logits_fallback(
+                        q_slice,
+                        k_quant,
+                        k_scale,
+                        weights[chunk.token_start : chunk.token_end],
+                        cu_seqlen_ks,
+                        cu_seqlen_ke,
+                    )
+                elif current_platform.is_xpu():
                     if q_scale_slice is not None:
                         raise RuntimeError("XPU fp8_mqa_logits does not support FP4 Q")
                     logits = torch.ops.vllm.xpu_fp8_mqa_logits(
@@ -530,7 +610,6 @@ def sparse_attn_indexer(
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode
         assert decode_metadata is not None
-        kv_cache = kv_cache_as_quant_view(kv_cache, head_dim, use_fp4_cache)
         decode_lens = decode_metadata.decode_lens
         if num_decode_tokens == 0:
             padded_q_quant_decode_tokens = q_quant[:1].reshape(1, 1, *q_quant.shape[1:])
@@ -584,7 +663,21 @@ def sparse_attn_indexer(
             if use_fp4_cache
             else padded_q_quant_decode_tokens
         )
-        if current_platform.is_xpu():
+        if current_platform.is_cuda() and not has_deep_gemm():
+            if use_fp4_cache:
+                raise RuntimeError(
+                    "The CUDA sparse indexer fallback supports FP8 cache only."
+                )
+            logits = _fp8_paged_mqa_logits_fallback(
+                padded_q_quant_decode_tokens,
+                kv_cache,
+                weights[:num_padded_tokens],
+                seq_lens,
+                decode_metadata.block_table,
+                head_dim,
+                max_model_len,
+            )
+        elif current_platform.is_xpu():
             if padded_q_scale is not None:
                 raise RuntimeError("XPU fp8_paged_mqa_logits does not support FP4 Q")
             seq_lens_xpu = (
@@ -592,7 +685,7 @@ def sparse_attn_indexer(
             )
             logits = torch.ops.vllm.xpu_fp8_paged_mqa_logits(
                 padded_q_quant_cast,
-                kv_cache,
+                kv_cache_as_quant_view(kv_cache, head_dim, use_fp4_cache),
                 weights[:num_padded_tokens],
                 seq_lens_xpu,
                 decode_metadata.block_table,
@@ -600,6 +693,7 @@ def sparse_attn_indexer(
                 max_model_len,
             )
         else:
+            kv_cache = kv_cache_as_quant_view(kv_cache, head_dim, use_fp4_cache)
             logits = fp8_fp4_paged_mqa_logits(
                 (padded_q_quant_cast, padded_q_scale),
                 kv_cache,
@@ -771,9 +865,13 @@ class SparseAttnIndexer(CustomOp):
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
         if current_platform.is_cuda() and not has_deep_gemm():
-            raise RuntimeError(
-                "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
-                "the current vLLM environment."
+            if self.use_fp4_cache:
+                raise RuntimeError(
+                    "The CUDA sparse indexer fallback supports FP8 cache only."
+                )
+            logger.info_once(
+                "DeepGEMM is unavailable; using the PyTorch FP8 sparse indexer "
+                "fallback."
             )
 
     def forward_native(
