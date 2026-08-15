@@ -240,11 +240,7 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             top_k=self.topk,
             hidden_size=self.hidden_dim,
             intermediate_size=self.intermediate_size_per_partition,
-            # vLLM currently runs this integration with its compilation and
-            # CUDA-graph pipeline disabled.  The eager wrapper uses
-            # FlashInfer's process-wide workspace cache, instead of retaining
-            # one max-token dynamic workspace per MoE layer.
-            use_cuda_graph=False,
+            use_cuda_graph=True,
             max_num_tokens=self.max_num_tokens,
             num_local_experts=self.num_local_experts,
             activation=self._activation_str,
