@@ -238,8 +238,6 @@ def _insert_context_kv(
     ``DeepseekV4Attention._fused_qnorm_rope_kv_insert``.
     """
     swa_cache = attn.swa_cache_layer.kv_cache
-    block_size = attn.swa_cache_layer.block_size
-    cos_sin_cache = attn.rotary_emb.cos_sin_cache
     cache_dtype = swa_cache.dtype
     n_ctx = kv.shape[0]
     dummy_q = torch.zeros(
@@ -247,6 +245,22 @@ def _insert_context_kv(
         dtype=kv.dtype,
         device=kv.device,
     )
+    if attn.kv_cache_dtype == "nvfp4_ds_mla":
+        from .ops.nvfp4_mla import prepare_q_and_store_nvfp4_mla_cache
+
+        prepare_q_and_store_nvfp4_mla_cache(
+            q=dummy_q,
+            kv=kv,
+            positions=positions,
+            rotary_emb=attn.rotary_emb,
+            cache=swa_cache,
+            slot_mapping=slot_mapping,
+            eps=attn.eps,
+        )
+        return
+
+    block_size = attn.swa_cache_layer.block_size
+    cos_sin_cache = attn.rotary_emb.cos_sin_cache
     if cache_dtype == torch.uint8:
         # fp8_ds_mla UE8M0 paged layout
         swa_2d = swa_cache.view(swa_cache.shape[0], -1)

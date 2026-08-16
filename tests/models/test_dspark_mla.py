@@ -11,6 +11,8 @@ from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.models.qwen3_dspark import DSparkMarkovHead
 from vllm.model_executor.models.registry import ModelRegistry
+from vllm.models.deepseek_v4.nvidia import dspark as deepseek_v4_dspark
+from vllm.models.deepseek_v4.nvidia.ops import nvfp4_mla
 from vllm.models.kimi_k3.nvidia import dspark_mla
 from vllm.models.kimi_k3.nvidia.dspark_mla import K3DSparkForCausalLM, K3DSparkModel
 
@@ -141,3 +143,45 @@ def test_k3_dspark_uses_replicated_markov_head(monkeypatch: pytest.MonkeyPatch):
     K3DSparkModel(vllm_config=vllm_config, start_layer_id=0, prefix="model")
 
     assert len(markov_head_calls) == 1
+
+
+@pytest.mark.cpu_test
+def test_deepseek_v4_dspark_uses_nvfp4_context_cache_store(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    cache = torch.empty(2, 16, 288, dtype=torch.uint8)
+    rotary_emb = object()
+    attn = SimpleNamespace(
+        kv_cache_dtype="nvfp4_ds_mla",
+        swa_cache_layer=SimpleNamespace(kv_cache=cache, block_size=16),
+        rotary_emb=rotary_emb,
+        n_local_heads=4,
+        head_dim=512,
+        eps=1e-6,
+    )
+    kv = torch.randn(3, 512, dtype=torch.bfloat16)
+    positions = torch.arange(3)
+    slot_mapping = torch.arange(3)
+    calls = []
+
+    def record_nvfp4_store(**kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(
+        nvfp4_mla,
+        "prepare_q_and_store_nvfp4_mla_cache",
+        record_nvfp4_store,
+    )
+
+    deepseek_v4_dspark._insert_context_kv(attn, kv, positions, slot_mapping)
+
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["q"].shape == (3, 4, 512)
+    assert call["q"].dtype == kv.dtype
+    assert call["kv"] is kv
+    assert call["positions"] is positions
+    assert call["rotary_emb"] is rotary_emb
+    assert call["cache"] is cache
+    assert call["slot_mapping"] is slot_mapping
+    assert call["eps"] == 1e-6
