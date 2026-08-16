@@ -71,6 +71,10 @@ def _process_b12x_weights(
         w2_weight_scale_2=w2_scale_2,
     )
     experts.process_weights_after_loading(layer)
+    assert experts.w1_scale is None
+    assert experts.w2_scale is None
+    assert layer.w13_weight_scale is None
+    assert layer.w2_weight_scale is None
 
 
 def test_flashinfer_b12x_wrapper_receives_swiglu_limit(monkeypatch):
@@ -101,6 +105,7 @@ def test_flashinfer_b12x_wrapper_receives_swiglu_limit(monkeypatch):
 
     assert captured["activation"] == "silu"
     assert captured["swiglu_limit"] == 10.0
+    assert captured["use_cuda_graph"] is False
 
 
 def test_flashinfer_b12x_sanitizes_padding_routes():

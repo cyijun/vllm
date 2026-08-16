@@ -20,11 +20,14 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Dynamic,
     kNvfp4Static,
 )
+from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import (
     flashinfer_convert_sf_to_mma_layout,
     has_flashinfer_b12x_moe,
 )
+
+_B12X_WORKSPACE_EVENT: torch.Event | None = None
 
 
 def _sanitize_b12x_topk(
@@ -167,6 +170,13 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             num_groups=num_experts_w2,
         )
 
+        # The MMA-layout tensors are complete copies. Drop the checkpoint
+        # layouts so each TP rank does not retain both representations.
+        self.quant_config._w1.scale = None
+        self.quant_config._w2.scale = None
+        replace_parameter(layer, "w13_weight_scale", None)
+        replace_parameter(layer, "w2_weight_scale", None)
+
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
         return mk.FusedMoEActivationFormat.Standard
@@ -250,7 +260,7 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             top_k=self.topk,
             hidden_size=self.hidden_dim,
             intermediate_size=self.intermediate_size_per_partition,
-            use_cuda_graph=True,
+            use_cuda_graph=False,
             max_num_tokens=self.max_num_tokens,
             num_local_experts=self.num_local_experts,
             activation=self._activation_str,
@@ -275,9 +285,8 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool | None,
     ):
-        assert self.w1_scale is not None and self.w2_scale is not None, (
-            "w1_scale and w2_scale must not be None for FlashInferB12xExperts"
-        )
+        global _B12X_WORKSPACE_EVENT
+
         assert self.g1_alphas is not None and self.g2_alphas is not None, (
             "g1_alphas and g2_alphas must not be None for FlashInferB12xExperts"
         )
@@ -300,8 +309,13 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             topk_ids, topk_weights
         )
 
-        wrapper_output = wrapper.run(
+        stream = current_platform.current_stream()
+        if _B12X_WORKSPACE_EVENT is not None:
+            stream.wait_event(_B12X_WORKSPACE_EVENT)
+
+        wrapper.run(
             x=hidden_states,
+            output=output,
             w1_weight=w1,
             w1_weight_sf=self.w1_sf_mma,
             w1_alpha=self.g1_alphas,
@@ -312,4 +326,6 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             token_selected_experts=token_selected_experts,
             token_final_scales=token_final_scales,
         )
-        output.copy_(wrapper_output)
+        if _B12X_WORKSPACE_EVENT is None:
+            _B12X_WORKSPACE_EVENT = torch.Event()
+        _B12X_WORKSPACE_EVENT.record(stream)
