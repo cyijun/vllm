@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from fnmatch import fnmatchcase
+
 import torch.nn as nn
 
 from vllm.config import VllmConfig, replace
@@ -12,6 +14,22 @@ from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
 )
 
 
+def _mtp_is_excluded_from_quantization(hf_config) -> bool:
+    quant_config = getattr(hf_config, "quantization_config", None) or {}
+    excluded = (
+        quant_config.get("ignore")
+        or quant_config.get("ignored_layers")
+        or quant_config.get("exclude_modules")
+        or []
+    )
+    mtp_expert = "mtp.0.ffn.experts"
+    return any(
+        isinstance(pattern, str)
+        and (pattern == "mtp" or fnmatchcase(mtp_expert, pattern))
+        for pattern in excluded
+    )
+
+
 def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
@@ -21,6 +39,9 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     from vllm.model_executor.models.qwen3_dflash import dflash_has_any_non_causal
     from vllm.model_executor.models.utils import get_draft_quant_config
 
+    draft_moe_backend = (
+        speculative_config.moe_backend or vllm_config.kernel_config.moe_backend
+    )
     draft_vllm_config = replace(
         vllm_config,
         attention_config=replace(
@@ -36,10 +57,20 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             if speculative_config.kv_cache_dtype is not None
             else vllm_config.cache_config
         ),
+        kernel_config=replace(
+            vllm_config.kernel_config,
+            moe_backend=draft_moe_backend,
+        ),
     )
     # VllmConfig post-init restores the target's quant config because the target
     # config is retained for DSpark's target-layer metadata, so we must override it.
-    draft_vllm_config.quant_config = get_draft_quant_config(vllm_config)
+    draft_quant_config = get_draft_quant_config(vllm_config)
+    if _mtp_is_excluded_from_quantization(draft_model_config.hf_config):
+        from vllm.models.deepseek_v4.quant_config import DeepseekV4FP8Config
+
+        if isinstance(draft_quant_config, DeepseekV4FP8Config):
+            draft_quant_config.use_native_mxfp4_moe()
+    draft_vllm_config.quant_config = draft_quant_config
 
     with set_model_tag("dspark_head"):
         draft_model = get_model(

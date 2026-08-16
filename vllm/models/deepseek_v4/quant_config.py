@@ -99,6 +99,10 @@ class DeepseekV4FP8Config(Fp8Config):
         self._resolve_moe_overrides()
         return self._resolved_moe_quant_algo or ""
 
+    def use_native_mxfp4_moe(self) -> None:
+        """Use the checkpoint's native MXFP4 expert representation."""
+        self._resolved_moe_quant_algo = ""
+
     def _get_nvfp4_config(self) -> ModelOptNvFp4Config:
         if self._nvfp4_config is None:
             from vllm.model_executor.layers.quantization.modelopt import (

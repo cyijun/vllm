@@ -13,8 +13,12 @@ from vllm.model_executor.models.qwen3_dspark import DSparkMarkovHead
 from vllm.model_executor.models.registry import ModelRegistry
 from vllm.models.deepseek_v4.nvidia import dspark as deepseek_v4_dspark
 from vllm.models.deepseek_v4.nvidia.ops import nvfp4_mla
+from vllm.models.deepseek_v4.quant_config import DeepseekV4FP8Config
 from vllm.models.kimi_k3.nvidia import dspark_mla
 from vllm.models.kimi_k3.nvidia.dspark_mla import K3DSparkForCausalLM, K3DSparkModel
+from vllm.v1.worker.gpu.spec_decode.dspark.utils import (
+    _mtp_is_excluded_from_quantization,
+)
 
 
 def test_dspark_mla_uses_compile_free_model_entrypoint():
@@ -185,3 +189,29 @@ def test_deepseek_v4_dspark_uses_nvfp4_context_cache_store(
     assert call["cache"] is cache
     assert call["slot_mapping"] is slot_mapping
     assert call["eps"] == 1e-6
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    ("quantization_config", "expected"),
+    [
+        ({"ignore": ["*.attn.*", "mtp.*"]}, True),
+        ({"ignored_layers": ["mtp"]}, True),
+        ({"exclude_modules": ["mtp.0.ffn.*"]}, True),
+        ({"ignore": ["*.attn.*"]}, False),
+        ({}, False),
+    ],
+)
+def test_deepseek_v4_dspark_detects_native_mtp_experts(quantization_config, expected):
+    hf_config = SimpleNamespace(quantization_config=quantization_config)
+    assert _mtp_is_excluded_from_quantization(hf_config) is expected
+
+
+@pytest.mark.cpu_test
+def test_deepseek_v4_quant_config_can_restore_native_mxfp4_moe():
+    quant_config = object.__new__(DeepseekV4FP8Config)
+    quant_config._resolved_moe_quant_algo = "NVFP4"
+
+    quant_config.use_native_mxfp4_moe()
+
+    assert quant_config.moe_quant_algo == ""
