@@ -34,7 +34,11 @@ def _dequant_nvfp4_mla_rows(
 ):
     """Load a candidate tile from the block-planar vLLM NVFP4 cache."""
     safe_indices = tl.maximum(row_indices, 0)
-    block_indices = safe_indices // cache_block_size
+    # Hybrid KV-cache groups pack multiple layers into each physical page, so
+    # cache_block_stride can be several MiB. Keep page-offset arithmetic in
+    # int64; int32 overflows well before a long-context cache reaches its last
+    # logical block.
+    block_indices = (safe_indices // cache_block_size).to(tl.int64)
     block_offsets = safe_indices % cache_block_size
 
     packed_offsets = dim_offsets // 2
@@ -86,9 +90,11 @@ def _nvfp4_mla_sparse_attention_kernel(
     query_stride_h,
     swa_cache_block_stride,
     swa_cache_block_size,
+    swa_cache_num_blocks,
     swa_indices_stride_t,
     extra_cache_block_stride,
     extra_cache_block_size,
+    extra_cache_num_blocks,
     extra_indices_stride_t,
     output_stride_t,
     output_stride_h,
@@ -130,6 +136,9 @@ def _nvfp4_mla_sparse_attention_kernel(
             other=-1,
         ).to(tl.int32)
         candidate_valid &= candidate_indices >= 0
+        candidate_valid &= (
+            candidate_indices < swa_cache_num_blocks * swa_cache_block_size
+        )
         kv = _dequant_nvfp4_mla_rows(
             swa_cache_ptr,
             candidate_indices,
@@ -167,6 +176,9 @@ def _nvfp4_mla_sparse_attention_kernel(
                 other=-1,
             ).to(tl.int32)
             candidate_valid &= candidate_indices >= 0
+            candidate_valid &= (
+                candidate_indices < extra_cache_num_blocks * extra_cache_block_size
+            )
             kv = _dequant_nvfp4_mla_rows(
                 extra_cache_ptr,
                 candidate_indices,
@@ -220,6 +232,7 @@ def _store_nvfp4_mla_cache_kernel(
     cache_ptr,
     cache_block_stride,
     cache_block_size,
+    cache_num_blocks,
     HEAD_DIM: tl.constexpr,
     DATA_BYTES: tl.constexpr,
     SCALE_BYTES: tl.constexpr,
@@ -229,6 +242,8 @@ def _store_nvfp4_mla_cache_kernel(
     token_idx = tl.program_id(0)
     slot = tl.load(slot_mapping_ptr + token_idx)
     if slot < 0:
+        return
+    if slot >= cache_num_blocks * cache_block_size:
         return
 
     offsets = tl.arange(0, HEAD_DIM)
@@ -279,6 +294,7 @@ def store_nvfp4_mla_cache(
         cache,
         cache.stride(0),
         cache.shape[1],
+        cache.shape[0],
         HEAD_DIM=NVFP4_MLA_HEAD_DIM,
         DATA_BYTES=NVFP4_MLA_DATA_BYTES,
         SCALE_BYTES=NVFP4_MLA_SCALE_BYTES,
@@ -398,9 +414,11 @@ def nvfp4_mla_sparse_attention(
             query.stride(1),
             swa_cache.stride(0),
             swa_cache.shape[1],
+            swa_cache.shape[0],
             swa_indices.stride(0),
             extra_cache_arg.stride(0),
             extra_cache_arg.shape[1],
+            extra_cache_arg.shape[0],
             extra_indices_arg.stride(0),
             output.stride(0),
             output.stride(1),

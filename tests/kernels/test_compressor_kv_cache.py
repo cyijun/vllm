@@ -110,8 +110,12 @@ def test_get_c128_boundary(starts, query_start_loc, expected):
 @pytest.mark.parametrize("num_queries", [2, 17])
 def test_nvfp4_mla_sparse_attention_matches_dequantized_cache(num_queries):
     torch.manual_seed(11)
-    backing = torch.zeros(5, 256, 288, dtype=torch.uint8, device="cuda")
-    cache = backing[1:]
+    page_bytes = 256 * 288
+    # Match hybrid KV allocation: each physical block packs several layer
+    # pages, so the selected layer view has a much larger block stride than
+    # its own page size and a nonzero page offset.
+    backing = torch.zeros(5, page_bytes * 3, dtype=torch.uint8, device="cuda")
+    cache = backing[:, page_bytes : 2 * page_bytes].view(5, 256, 288)[1:]
     kv = torch.randn(4, 512, dtype=torch.bfloat16, device="cuda") * 3
     slots = torch.tensor([0, 257, 513, 769], dtype=torch.int64, device="cuda")
     store_nvfp4_mla_cache(kv, slots, cache)
