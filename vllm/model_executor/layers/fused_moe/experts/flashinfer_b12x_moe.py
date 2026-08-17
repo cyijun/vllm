@@ -15,6 +15,8 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
+    kMxfp4Dynamic,
+    kMxfp4Static,
     kNvfp4Dynamic,
     kNvfp4Static,
 )
@@ -48,7 +50,7 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
     ``convert_sf_to_mma_layout`` once during ``process_weights_after_loading``
     and cached as ``w1_sf_mma`` / ``w2_sf_mma``.
 
-    Only NVFP4 (kNvfp4Static/kNvfp4Dynamic) quantization is supported.
+    NVFP4 and MXFP4 W4A4 quantization are supported.
     """
 
     _ACTIVATION_MAP: dict[MoEActivation, str] = {
@@ -62,9 +64,10 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
         quant_config: FusedMoEQuantConfig,
     ):
         super().__init__(moe_config=moe_config, quant_config=quant_config)
-        assert quant_config.quant_dtype == "nvfp4", (
-            "FlashInferB12xExperts only supports nvfp4 quantization."
+        assert quant_config.quant_dtype in ("nvfp4", "mxfp4"), (
+            "FlashInferB12xExperts only supports nvfp4 or mxfp4 quantization."
         )
+        self.quant_mode = quant_config.quant_dtype
         self.out_dtype = moe_config.in_dtype
         self.num_local_experts = moe_config.num_local_experts
         self.ep_rank = moe_config.moe_parallel_config.ep_rank
@@ -73,6 +76,8 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
         # a synthesized uniform-1.0 tensor for W4A16 checkpoints that lack
         # one. Holding it on the instance keeps apply() alloc-free.
         self._fc2_input_scale: torch.Tensor | None = None
+        self._w1_alpha: torch.Tensor | None = None
+        self._w2_alpha: torch.Tensor | None = None
 
         # Shape params for B12xMoEWrapper construction.
         self.global_num_experts = moe_config.num_experts
@@ -98,69 +103,76 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
         self.w2_sf_mma: torch.Tensor | None = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # Normalise block scales to absorb the per-expert weight global scale
-        # (w_gs).  vLLM's NVFP4 convention stores:
-        #   block_scale = max_abs * w_gs / fp4_max,  g1_alphas = 1/w_gs
-        # The SM12x kernel treats w1_alpha (= g1_alphas) as a per-expert weight
-        # dequant multiplier separate from input_gs (activation scale).  We bake
-        # w_gs into the block scales so that w1_alpha = 1.0 and the kernel sees
-        # the simpler form:
-        #   block_scale = max_abs / fp4_max,  w1_alpha = 1.0
-        # The FP4-packed values and dequantised results are identical in both
-        # representations.  We set scale_2 = 1.0 to signal that the bake-in is
-        # already done.
-        layer.w13_weight_scale.data = (
-            layer.w13_weight_scale.float() * layer.w13_weight_scale_2.view(-1, 1, 1)
-        ).to(layer.w13_weight_scale.dtype)
-        layer.w13_weight_scale_2.data.fill_(1.0)
+        if self.quant_mode == "nvfp4":
+            # Absorb NVFP4's per-expert global scale into its block scales.
+            layer.w13_weight_scale.data = (
+                layer.w13_weight_scale.float() * layer.w13_weight_scale_2.view(-1, 1, 1)
+            ).to(layer.w13_weight_scale.dtype)
+            layer.w13_weight_scale_2.data.fill_(1.0)
+            layer.w2_weight_scale.data = (
+                layer.w2_weight_scale.float() * layer.w2_weight_scale_2.view(-1, 1, 1)
+            ).to(layer.w2_weight_scale.dtype)
+            layer.w2_weight_scale_2.data.fill_(1.0)
 
-        layer.w2_weight_scale.data = (
-            layer.w2_weight_scale.float() * layer.w2_weight_scale_2.view(-1, 1, 1)
-        ).to(layer.w2_weight_scale.dtype)
-        layer.w2_weight_scale_2.data.fill_(1.0)
-
-        # The SM12x kernel uses dynamic per-block quantization for FC2 input
-        # activations (the SwiGLU output before the down projection).  The
-        # calibrated a2_gscale from the modelopt checkpoint (~tens to hundreds)
-        # is intended for static-quantisation backends (TRTLLM/CUTLASS) and
-        # causes every intermediate activation to saturate at max FP4 when
-        # multiplied by values that large.  Force to 1.0 so the kernel uses
-        # its own per-block dynamic scale.
-        if self.a2_gscale is not None:
-            self.a2_gscale.fill_(1.0)
-            self._fc2_input_scale = self.a2_gscale
+            # B12X dynamically quantizes the FC2 input, so calibrated static
+            # activation scales must not be applied a second time.
+            if self.a2_gscale is not None:
+                self.a2_gscale.fill_(1.0)
+                self._fc2_input_scale = self.a2_gscale
+            else:
+                self._fc2_input_scale = torch.ones(
+                    self.num_local_experts,
+                    device=layer.w13_weight.device,
+                    dtype=torch.float32,
+                )
+            self._w1_alpha = self.g1_alphas
+            self._w2_alpha = self.g2_alphas
+            sf_vec_size = 16
         else:
-            # W4A16 NVFP4 checkpoints have no calibrated a2_gscale; b12x
-            # performs dynamic per-block FC2-input quantization, so a uniform
-            # 1.0 scale per expert is equivalent to the bake-in above for
-            # static-quant checkpoints. Allocate once here so apply() stays
-            # alloc-free.
-            self._fc2_input_scale = torch.ones(
+            # OCP MXFP4 carries its complete scale in each UE8M0 block-scale
+            # byte; no separate expert alpha or FC2 input scale is used.
+            ones = torch.ones(
                 self.num_local_experts,
                 device=layer.w13_weight.device,
                 dtype=torch.float32,
             )
+            self._w1_alpha = ones
+            self._w2_alpha = ones
+            self._fc2_input_scale = None
+            sf_vec_size = 32
 
         # Precompute MMA-layout views of the weight scale factors once here
         # rather than recomputing on every forward pass.
         assert self.w1_scale is not None
-        num_experts_w1, m1, k1_sf = self.w1_scale.shape
-        k1 = k1_sf * 16
+        num_experts_w1, m1_padded, k1_sf_padded = self.w1_scale.shape
+        if self.quant_mode == "mxfp4":
+            m1 = layer.w13_weight.shape[1]
+            k1 = layer.w13_weight.shape[2] * 2
+        else:
+            m1 = m1_padded
+            k1 = k1_sf_padded * sf_vec_size
         self.w1_sf_mma = flashinfer_convert_sf_to_mma_layout(
-            self.w1_scale.reshape(num_experts_w1 * m1, k1_sf),
+            self.w1_scale.reshape(num_experts_w1 * m1_padded, k1_sf_padded),
             m=m1,
             k=k1,
             num_groups=num_experts_w1,
+            sf_vec_size=sf_vec_size,
         )
 
         assert self.w2_scale is not None
-        num_experts_w2, m2, k2_sf = self.w2_scale.shape
-        k2 = k2_sf * 16
+        num_experts_w2, m2_padded, k2_sf_padded = self.w2_scale.shape
+        if self.quant_mode == "mxfp4":
+            m2 = layer.w2_weight.shape[1]
+            k2 = layer.w2_weight.shape[2] * 2
+        else:
+            m2 = m2_padded
+            k2 = k2_sf_padded * sf_vec_size
         self.w2_sf_mma = flashinfer_convert_sf_to_mma_layout(
-            self.w2_scale.reshape(num_experts_w2 * m2, k2_sf),
+            self.w2_scale.reshape(num_experts_w2 * m2_padded, k2_sf_padded),
             m=m2,
             k=k2,
             num_groups=num_experts_w2,
+            sf_vec_size=sf_vec_size,
         )
 
     @staticmethod
@@ -191,6 +203,7 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
         return (weight_key, activation_key) in (
             (kNvfp4Static, kNvfp4Dynamic),
             (kNvfp4Static, None),
+            (kMxfp4Static, kMxfp4Dynamic),
         )
 
     @staticmethod
@@ -252,11 +265,11 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool | None,
     ):
-        assert self.g1_alphas is not None and self.g2_alphas is not None, (
-            "g1_alphas and g2_alphas must not be None for FlashInferB12xExperts"
+        assert self._w1_alpha is not None and self._w2_alpha is not None, (
+            "process_weights_after_loading must initialize B12X expert alphas"
         )
-        assert self._fc2_input_scale is not None, (
-            "_fc2_input_scale must be set by process_weights_after_loading"
+        assert self.quant_mode != "nvfp4" or self._fc2_input_scale is not None, (
+            "NVFP4 requires process_weights_after_loading to set FC2 input scale"
         )
         assert self.w1_sf_mma is not None and self.w2_sf_mma is not None, (
             "process_weights_after_loading must run before FlashInferB12xExperts.apply"
@@ -283,11 +296,11 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             output=output,
             w1_weight=w1,
             w1_weight_sf=self.w1_sf_mma,
-            w1_alpha=self.g1_alphas,
+            w1_alpha=self._w1_alpha,
             fc2_input_scale=self._fc2_input_scale,
             w2_weight=w2,
             w2_weight_sf=self.w2_sf_mma,
-            w2_alpha=self.g2_alphas,
+            w2_alpha=self._w2_alpha,
             token_selected_experts=token_selected_experts,
             token_final_scales=token_final_scales,
             num_experts=self.global_num_experts,
@@ -295,5 +308,5 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             num_local_experts=self.num_local_experts,
             activation=self._activation_str,
             swiglu_limit=self.swiglu_limit,
-            quant_mode="nvfp4",
+            quant_mode=self.quant_mode,
         )

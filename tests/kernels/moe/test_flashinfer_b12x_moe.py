@@ -27,6 +27,7 @@ if not has_flashinfer_b12x_moe():
 
 # Import fp4_quantize after the skip guard — FlashInfer must be installed.
 from flashinfer.fp4_quantization import fp4_quantize
+from flashinfer.quantization import SfLayout, mxfp4_dequantize, mxfp4_quantize
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from tests.kernels.moe.utils import make_dummy_moe_config
@@ -37,10 +38,18 @@ from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.all2all_utils import (
     maybe_make_prepare_finalize,
 )
-from vllm.model_executor.layers.fused_moe.config import nvfp4_moe_quant_config
+from vllm.model_executor.layers.fused_moe.config import (
+    nvfp4_moe_quant_config,
+    ocp_mx_moe_quant_config,
+)
 from vllm.model_executor.layers.fused_moe.experts.flashinfer_b12x_moe import (
     FlashInferB12xExperts,
     _sanitize_b12x_topk,
+)
+from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
+    Mxfp4MoeBackend,
+    convert_weight_to_mxfp4_moe_kernel_format,
+    select_deepseek_v4_mxfp4_moe_backend,
 )
 from vllm.model_executor.layers.quantization.utils.flashinfer_fp4_moe import (
     reorder_w1w3_to_w3w1,
@@ -97,6 +106,8 @@ def test_flashinfer_b12x_functional_call_receives_swiglu_limit(monkeypatch):
     )
     experts = FlashInferB12xExperts(moe_config, quant_config)
     experts._fc2_input_scale = ones
+    experts._w1_alpha = ones
+    experts._w2_alpha = ones
     experts.w1_sf_mma = ones
     experts.w2_sf_mma = ones
 
@@ -154,6 +165,23 @@ def test_flashinfer_b12x_sanitizes_padding_routes():
     # Sanitization must not mutate tensors potentially reused by other stages.
     assert (topk_ids == -1).sum().item() == 3
     assert topk_weights[1, 1].item() == -2.0
+
+
+@pytest.mark.parametrize("requested_backend", ["auto", "flashinfer_b12x"])
+def test_flashinfer_b12x_selected_for_mxfp4(requested_backend):
+    moe_config = make_dummy_moe_config(
+        num_experts=8,
+        experts_per_token=2,
+        hidden_dim=256,
+        intermediate_size=128,
+        swiglu_limit=10.0,
+    )
+    moe_config.moe_backend = requested_backend
+
+    backend, experts_cls = select_deepseek_v4_mxfp4_moe_backend(moe_config)
+
+    assert backend == Mxfp4MoeBackend.FLASHINFER_B12X
+    assert experts_cls is FlashInferB12xExperts
 
 
 @torch.inference_mode()
@@ -248,6 +276,140 @@ def test_flashinfer_b12x_functional_adapter_cuda_graph(workspace_init):
 
         assert torch.isfinite(output).all()
         torch.testing.assert_close(output, eager_output, atol=1e-2, rtol=1e-2)
+
+
+@torch.inference_mode()
+def test_flashinfer_b12x_mxfp4_moe(workspace_init):
+    """Checkpoint-layout MXFP4 weights run through the B12X W4A4 path."""
+    m, n, k, e, topk = 8, 128, 256, 8, 2
+    dtype = torch.bfloat16
+    set_random_seed(19)
+
+    with set_current_vllm_config(
+        VllmConfig(parallel_config=ParallelConfig(pipeline_parallel_size=1))
+    ):
+        hidden_states = torch.randn((m, k), device="cuda", dtype=dtype) / 10
+        w13_bf16 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 10
+        w2_bf16 = torch.randn((e, k, n), device="cuda", dtype=dtype) / 10
+
+        def quantize_checkpoint_weights(
+            weight: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            packed, scales, reference = [], [], []
+            for expert_weight in weight:
+                expert_packed, expert_scale = mxfp4_quantize(
+                    expert_weight,
+                    sfLayout=SfLayout.layout_linear,
+                )
+                packed.append(expert_packed)
+                scales.append(expert_scale)
+                reference.append(
+                    mxfp4_dequantize(
+                        expert_packed,
+                        expert_scale,
+                        sfLayout=SfLayout.layout_linear,
+                    ).to(device=weight.device, dtype=weight.dtype)
+                )
+            return torch.stack(packed), torch.stack(scales), torch.stack(reference)
+
+        w13_q, w13_scale, w13_reference = quantize_checkpoint_weights(w13_bf16)
+        w2_q, w2_scale, w2_reference = quantize_checkpoint_weights(w2_bf16)
+        layer = SimpleNamespace()
+        w13_q, w2_q, w13_scale, w2_scale, _, _ = (
+            convert_weight_to_mxfp4_moe_kernel_format(
+                mxfp4_backend=Mxfp4MoeBackend.FLASHINFER_B12X,
+                layer=layer,
+                w13_weight=w13_q,
+                w2_weight=w2_q,
+                w13_weight_scale=w13_scale,
+                w2_weight_scale=w2_scale,
+            )
+        )
+        layer.w13_weight = w13_q
+        layer.w2_weight = w2_q
+        layer.w13_weight_scale = w13_scale
+        layer.w2_weight_scale = w2_scale
+
+        quant_config = ocp_mx_moe_quant_config(
+            quant_dtype="mxfp4",
+            w1_scale=w13_scale,
+            w2_scale=w2_scale,
+        )
+        moe_config = make_dummy_moe_config(
+            num_experts=e,
+            experts_per_token=topk,
+            hidden_dim=k,
+            intermediate_size=n,
+            in_dtype=dtype,
+        )
+        experts = FlashInferB12xExperts(moe_config, quant_config)
+        experts.process_weights_after_loading(layer)
+        kernel = mk.FusedMoEKernel(
+            maybe_make_prepare_finalize(
+                moe=moe_config,
+                quant_config=quant_config,
+                allow_new_interface=True,
+                use_monolithic=False,
+            ),
+            experts,
+        )
+
+        score = torch.randn((m, e), device="cuda", dtype=dtype)
+        topk_weights, topk_ids, _ = fused_topk(
+            hidden_states, score, topk, renormalize=False
+        )
+        b12x_output = kernel.apply(
+            hidden_states=hidden_states,
+            w1=w13_q,
+            w2=w2_q,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            global_num_experts=e,
+            activation=MoEActivation.SILU,
+            apply_router_weight_on_input=False,
+            expert_map=None,
+        )
+        reference = torch_moe(
+            hidden_states,
+            w13_reference,
+            w2_reference,
+            score,
+            topk,
+        )
+
+        assert experts.quant_mode == "mxfp4"
+        torch.testing.assert_close(b12x_output, reference, atol=2e-1, rtol=2e-1)
+
+        graph_output = torch.empty_like(hidden_states)
+
+        def apply() -> None:
+            experts.apply(
+                output=graph_output,
+                hidden_states=hidden_states,
+                w1=w13_q,
+                w2=w2_q,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation=MoEActivation.SILU,
+                global_num_experts=e,
+                expert_map=None,
+                a1q_scale=None,
+                a2_scale=None,
+                workspace13=None,
+                workspace2=None,
+                expert_tokens_meta=None,
+                apply_router_weight_on_input=False,
+            )
+
+        apply()
+        torch.accelerator.synchronize()
+        eager_output = graph_output.clone()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            apply()
+        graph.replay()
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(graph_output, eager_output, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("m,n,k", MNK_FACTORS)

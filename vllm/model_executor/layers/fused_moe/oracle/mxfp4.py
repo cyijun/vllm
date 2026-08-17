@@ -104,6 +104,8 @@ class Mxfp4MoeBackend(Enum):
     # FlashInfer CUTLASS backends
     FLASHINFER_CUTLASS_MXFP4_MXFP8 = "FLASHINFER_CUTLASS_MXFP4_MXFP8"
     FLASHINFER_CUTLASS_MXFP4_BF16 = "FLASHINFER_CUTLASS_MXFP4_BF16"
+    # FlashInfer CuTe-DSL SM12x MXFP4 W4A4 backend
+    FLASHINFER_B12X = "FLASHINFER_B12X"
     # Marlin
     BATCHED_MARLIN = "BATCHED_MARLIN"
     MARLIN = "MARLIN"
@@ -177,6 +179,13 @@ def backend_to_kernel_cls(
         )
 
         return [FlashInferExperts]
+
+    elif backend == Mxfp4MoeBackend.FLASHINFER_B12X:
+        from vllm.model_executor.layers.fused_moe.experts.flashinfer_b12x_moe import (  # noqa: E501
+            FlashInferB12xExperts,
+        )
+
+        return [FlashInferB12xExperts]
 
     elif backend == Mxfp4MoeBackend.TRITON:
         from vllm.model_executor.layers.fused_moe.experts.gpt_oss_triton_kernels_moe import (  # noqa: E501
@@ -284,6 +293,7 @@ def map_mxfp4_backend(runner_backend: MoEBackend) -> list[Mxfp4MoeBackend]:
             Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8,
         ],
         "flashinfer_cutlass_afp8": [Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8],
+        "flashinfer_b12x": [Mxfp4MoeBackend.FLASHINFER_B12X],
         "triton": [Mxfp4MoeBackend.TRITON],
         "triton_unfused": [Mxfp4MoeBackend.TRITON_UNFUSED],
         "humming": [Mxfp4MoeBackend.HUMMING],
@@ -344,6 +354,7 @@ def _get_priority_backends() -> list[Mxfp4MoeBackend]:
     if current_platform.is_xpu():
         return [Mxfp4MoeBackend.XPU]
     _AVAILABLE_BACKENDS = [
+        Mxfp4MoeBackend.FLASHINFER_B12X,
         Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8,
         Mxfp4MoeBackend.DEEPGEMM_MXFP4,
         # TRITON_UNFUSED has bug with MTP support
@@ -367,6 +378,8 @@ def _backend_activation_key(backend: Mxfp4MoeBackend) -> QuantKey | None:
     if backend == Mxfp4MoeBackend.AITER_MXFP4_FP8:
         return kFp8StaticTensorSym
     if backend == Mxfp4MoeBackend.AITER_MXFP4_MXFP4:
+        return kMxfp4Dynamic
+    if backend == Mxfp4MoeBackend.FLASHINFER_B12X:
         return kMxfp4Dynamic
     return None  # BF16 activation
 
@@ -645,6 +658,9 @@ def mxfp4_round_up_hidden_size_and_intermediate_size(
         hidden_size = round_up(hidden_size, OCP_MX_BLOCK_SIZE)
     elif backend == Mxfp4MoeBackend.DEEPGEMM_MXFP4:
         # DeepGEMM requires M/N/K alignment
+        intermediate_size = round_up(intermediate_size, 128)
+        hidden_size = round_up(hidden_size, 128)
+    elif backend == Mxfp4MoeBackend.FLASHINFER_B12X:
         intermediate_size = round_up(intermediate_size, 128)
         hidden_size = round_up(hidden_size, 128)
     elif backend in (Mxfp4MoeBackend.MARLIN, Mxfp4MoeBackend.BATCHED_MARLIN):
@@ -1247,6 +1263,31 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
         )
 
 
+def _swizzle_mxfp4_scale_for_b12x(scale: torch.Tensor) -> torch.Tensor:
+    """Convert linear [expert, row, K/32] scales to B12X 128x4 storage."""
+    if scale.ndim != 3:
+        raise ValueError(f"expected a 3-D MXFP4 scale tensor, got {scale.shape}")
+
+    num_experts, rows, cols = scale.shape
+    rows_padded = round_up(rows, 128)
+    cols_padded = round_up(cols, 4)
+    padded = scale.new_zeros((num_experts, rows_padded, cols_padded))
+    padded[:, :rows, :cols] = scale
+    return (
+        padded.reshape(
+            num_experts,
+            rows_padded // 128,
+            4,
+            32,
+            cols_padded // 4,
+            4,
+        )
+        .permute(0, 1, 4, 3, 2, 5)
+        .contiguous()
+        .reshape(num_experts, rows_padded, cols_padded)
+    )
+
+
 def convert_weight_to_mxfp4_moe_kernel_format(
     mxfp4_backend: Mxfp4MoeBackend,
     layer: torch.nn.Module,
@@ -1267,7 +1308,8 @@ def convert_weight_to_mxfp4_moe_kernel_format(
 ]:
     """Convert loaded weights into backend-specific kernel format.
 
-    Supports DeepGEMM, TRTLLM MXFP8, Triton and Marlin backends.
+    Supports DeepGEMM, FlashInfer B12X, TRTLLM MXFP8, Triton and Marlin
+    backends.
     """
     is_gfx1250 = False
     if current_platform.is_rocm():
@@ -1290,6 +1332,26 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             w2_weight_scale,
             w13_bias,
             w2_bias,
+        )
+
+    if mxfp4_backend == Mxfp4MoeBackend.FLASHINFER_B12X:
+        if w13_bias is not None or w2_bias is not None:
+            raise ValueError("FlashInfer B12X MXFP4 does not support expert bias")
+
+        # Checkpoints store the fused projection as [gate, up]. B12X consumes
+        # [up, gate], with one scale byte per block of 32 input elements.
+        gate_weight, up_weight = w13_weight.data.chunk(2, dim=1)
+        gate_scale, up_scale = w13_weight_scale.data.chunk(2, dim=1)
+        w13_weight = torch.cat((up_weight, gate_weight), dim=1).contiguous()
+        w13_weight_scale = torch.cat((up_scale, gate_scale), dim=1).contiguous()
+
+        return (
+            w13_weight,
+            w2_weight.data,
+            _swizzle_mxfp4_scale_for_b12x(w13_weight_scale),
+            _swizzle_mxfp4_scale_for_b12x(w2_weight_scale.data),
+            None,
+            None,
         )
 
     if mxfp4_backend == Mxfp4MoeBackend.HUMMING:
@@ -1652,7 +1714,10 @@ def make_mxfp4_moe_quant_config(
             block_shape=None,
             gemm1_clamp_limit=swiglu_limit,
         )
-    elif mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_MXFP4:
+    elif mxfp4_backend in (
+        Mxfp4MoeBackend.AITER_MXFP4_MXFP4,
+        Mxfp4MoeBackend.FLASHINFER_B12X,
+    ):
         return ocp_mx_moe_quant_config(
             quant_dtype="mxfp4",
             w1_bias=w1_bias,

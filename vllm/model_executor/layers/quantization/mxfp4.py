@@ -776,6 +776,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 routing_tables=layer._expert_routing_tables(),
                 layer=layer,
             )
+            if self.mxfp4_backend == Mxfp4MoeBackend.FLASHINFER_B12X:
+                self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
     def _setup_kernel_k3_situ(self, layer: RoutedExperts) -> None:
         # K3's AITER A16W4 kernel wants the separated ([gate_all, up_all])
