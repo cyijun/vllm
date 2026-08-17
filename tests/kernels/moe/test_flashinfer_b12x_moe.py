@@ -73,14 +73,14 @@ def _process_b12x_weights(
     experts.process_weights_after_loading(layer)
 
 
-def test_flashinfer_b12x_wrapper_receives_swiglu_limit(monkeypatch):
+def test_flashinfer_b12x_functional_call_receives_swiglu_limit(monkeypatch):
     captured = {}
 
-    class FakeB12xMoEWrapper:
-        def __init__(self, **kwargs):
-            captured.update(kwargs)
+    def fake_b12x_fused_moe(**kwargs):
+        captured.update(kwargs)
+        return kwargs["output"]
 
-    monkeypatch.setattr("flashinfer.fused_moe.B12xMoEWrapper", FakeB12xMoEWrapper)
+    monkeypatch.setattr("flashinfer.fused_moe.b12x_fused_moe", fake_b12x_fused_moe)
     ones = torch.ones(1, dtype=torch.float32, device="cuda")
     quant_config = nvfp4_moe_quant_config(
         g1_alphas=ones,
@@ -96,12 +96,37 @@ def test_flashinfer_b12x_wrapper_receives_swiglu_limit(monkeypatch):
         swiglu_limit=10.0,
     )
     experts = FlashInferB12xExperts(moe_config, quant_config)
+    experts._fc2_input_scale = ones
+    experts.w1_sf_mma = ones
+    experts.w2_sf_mma = ones
 
-    experts._ensure_wrapper()
+    hidden_states = torch.zeros((1, 256), dtype=torch.bfloat16, device="cuda")
+    output = torch.empty_like(hidden_states)
+    topk_ids = torch.zeros((1, 2), dtype=torch.int64, device="cuda")
+    topk_weights = torch.ones((1, 2), dtype=torch.float32, device="cuda")
+    weight = torch.empty(1, dtype=torch.uint8, device="cuda")
+    experts.apply(
+        output=output,
+        hidden_states=hidden_states,
+        w1=weight,
+        w2=weight,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        activation=MoEActivation.SILU,
+        global_num_experts=moe_config.num_experts,
+        expert_map=None,
+        a1q_scale=None,
+        a2_scale=None,
+        workspace13=None,
+        workspace2=None,
+        expert_tokens_meta=None,
+        apply_router_weight_on_input=False,
+    )
 
     assert captured["activation"] == "silu"
     assert captured["swiglu_limit"] == 10.0
-    assert captured["use_cuda_graph"] is False
+    assert captured["output"] is output
+    assert captured["quant_mode"] == "nvfp4"
 
 
 def test_flashinfer_b12x_sanitizes_padding_routes():
@@ -129,6 +154,100 @@ def test_flashinfer_b12x_sanitizes_padding_routes():
     # Sanitization must not mutate tensors potentially reused by other stages.
     assert (topk_ids == -1).sum().item() == 3
     assert topk_weights[1, 1].item() == -2.0
+
+
+@torch.inference_mode()
+def test_flashinfer_b12x_functional_adapter_cuda_graph(workspace_init):
+    """The shared functional workspace must survive capture and replay."""
+    m, n, k, e, topk = 8, 128, 256, 8, 2
+    dtype = torch.bfloat16
+    set_random_seed(11)
+
+    with set_current_vllm_config(
+        VllmConfig(parallel_config=ParallelConfig(pipeline_parallel_size=1))
+    ):
+        hidden_states = torch.randn((m, k), device="cuda", dtype=dtype) / 10
+        w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 15
+        w2 = torch.randn((e, k, n), device="cuda", dtype=dtype) / 15
+
+        dummy_scale = torch.ones((e, 2 * n, 1), device="cuda", dtype=torch.float32)
+        w1, _ = reorder_w1w3_to_w3w1(w1, dummy_scale)
+        global_scale = torch.ones(1, device="cuda", dtype=torch.float32)
+        w1_q_flat, w1_sf_flat = fp4_quantize(
+            w1.reshape(e * 2 * n, k),
+            global_scale=global_scale,
+            sf_vec_size=16,
+            is_sf_swizzled_layout=True,
+        )
+        w2_q_flat, w2_sf_flat = fp4_quantize(
+            w2.reshape(e * k, n),
+            global_scale=global_scale,
+            sf_vec_size=16,
+            is_sf_swizzled_layout=True,
+        )
+        w1_q = w1_q_flat.view(e, 2 * n, k // 2)
+        w2_q = w2_q_flat.view(e, k, n // 2)
+        w1_sf = w1_sf_flat.view(e, 2 * n, w1_sf_flat.shape[1])
+        w2_sf = w2_sf_flat.view(e, k, w2_sf_flat.shape[1])
+        ones_e = torch.ones(e, device="cuda", dtype=torch.float32)
+
+        quant_config = nvfp4_moe_quant_config(
+            g1_alphas=ones_e,
+            g2_alphas=ones_e,
+            a1_gscale=ones_e,
+            a2_gscale=ones_e,
+            w1_scale=w1_sf,
+            w2_scale=w2_sf,
+        )
+        moe_config = make_dummy_moe_config(
+            num_experts=e,
+            experts_per_token=topk,
+            hidden_dim=k,
+            intermediate_size=n,
+            in_dtype=dtype,
+        )
+        experts = FlashInferB12xExperts(moe_config, quant_config)
+        _process_b12x_weights(experts, w1_sf, w2_sf, ones_e, ones_e)
+
+        score = torch.randn((m, e), device="cuda", dtype=dtype)
+        topk_weights, topk_ids, _ = fused_topk(
+            hidden_states, score, topk, renormalize=False
+        )
+        output = torch.empty_like(hidden_states)
+
+        def apply() -> None:
+            experts.apply(
+                output=output,
+                hidden_states=hidden_states,
+                w1=w1_q,
+                w2=w2_q,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation=MoEActivation.SILU,
+                global_num_experts=e,
+                expert_map=None,
+                a1q_scale=None,
+                a2_scale=None,
+                workspace13=None,
+                workspace2=None,
+                expert_tokens_meta=None,
+                apply_router_weight_on_input=False,
+            )
+
+        # Populate FlashInfer's process-wide weight/workspace caches before
+        # capture; capture itself must not grow either cache.
+        apply()
+        torch.accelerator.synchronize()
+        eager_output = output.clone()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            apply()
+        graph.replay()
+        torch.accelerator.synchronize()
+
+        assert torch.isfinite(output).all()
+        torch.testing.assert_close(output, eager_output, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.parametrize("m,n,k", MNK_FACTORS)

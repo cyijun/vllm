@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import Any
-
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -25,8 +23,6 @@ from vllm.utils.flashinfer import (
     flashinfer_convert_sf_to_mma_layout,
     has_flashinfer_b12x_moe,
 )
-
-_B12X_WORKSPACE_EVENT: torch.Event | None = None
 
 
 def _sanitize_b12x_topk(
@@ -98,8 +94,6 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             )
         self._activation_str = self._ACTIVATION_MAP[activation]
 
-        # Lazily created on first apply() call.
-        self._wrapper: Any | None = None
         self.w1_sf_mma: torch.Tensor | None = None
         self.w2_sf_mma: torch.Tensor | None = None
 
@@ -240,25 +234,6 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
         # from pre-quantizing activations.
         return True
 
-    def _ensure_wrapper(self) -> None:
-        """Lazily create B12xMoEWrapper on first use."""
-        if self._wrapper is not None:
-            return
-
-        from flashinfer.fused_moe import B12xMoEWrapper
-
-        self._wrapper = B12xMoEWrapper(
-            num_experts=self.global_num_experts,
-            top_k=self.topk,
-            hidden_size=self.hidden_dim,
-            intermediate_size=self.intermediate_size_per_partition,
-            use_cuda_graph=False,
-            max_num_tokens=self.max_num_tokens,
-            num_local_experts=self.num_local_experts,
-            activation=self._activation_str,
-            swiglu_limit=self.swiglu_limit,
-        )
-
     def apply(
         self,
         output: torch.Tensor,
@@ -277,8 +252,6 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool | None,
     ):
-        global _B12X_WORKSPACE_EVENT
-
         assert self.g1_alphas is not None and self.g2_alphas is not None, (
             "g1_alphas and g2_alphas must not be None for FlashInferB12xExperts"
         )
@@ -289,10 +262,6 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             "process_weights_after_loading must run before FlashInferB12xExperts.apply"
         )
 
-        self._ensure_wrapper()
-        wrapper = self._wrapper
-        assert wrapper is not None
-
         # vLLM uses -1 expert IDs for cudagraph/profile padding.  Most MoE
         # backends consume that sentinel directly, while B12X requires every
         # expert ID to be in range.  Route padding through expert 0 with a zero
@@ -301,11 +270,15 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             topk_ids, topk_weights
         )
 
-        stream = current_platform.current_stream()
-        if _B12X_WORKSPACE_EVENT is not None:
-            stream.wait_event(_B12X_WORKSPACE_EVENT)
+        # The functional API reuses FlashInfer's process-wide workspace cache.
+        # vLLM warms the largest capture shape before CUDA graph capture, and
+        # supplying ``output`` keeps the captured call allocation-free.  Avoid
+        # a process-wide CUDA Event here: every layer executes in order on the
+        # current stream, while recording the same event repeatedly inside
+        # multiple captured graphs creates invalid cross-graph dependencies.
+        from flashinfer.fused_moe import b12x_fused_moe
 
-        wrapper.run(
+        b12x_fused_moe(
             x=hidden_states,
             output=output,
             w1_weight=w1,
@@ -317,7 +290,10 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             w2_alpha=self.g2_alphas,
             token_selected_experts=token_selected_experts,
             token_final_scales=token_final_scales,
+            num_experts=self.global_num_experts,
+            top_k=self.topk,
+            num_local_experts=self.num_local_experts,
+            activation=self._activation_str,
+            swiglu_limit=self.swiglu_limit,
+            quant_mode="nvfp4",
         )
-        if _B12X_WORKSPACE_EVENT is None:
-            _B12X_WORKSPACE_EVENT = torch.Event()
-        _B12X_WORKSPACE_EVENT.record(stream)
