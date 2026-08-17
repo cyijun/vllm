@@ -20,7 +20,6 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Dynamic,
     kNvfp4Static,
 )
-from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import (
     flashinfer_convert_sf_to_mma_layout,
@@ -169,13 +168,6 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             k=k2,
             num_groups=num_experts_w2,
         )
-
-        # The MMA-layout tensors are complete copies. Drop the checkpoint
-        # layouts so each TP rank does not retain both representations.
-        self.quant_config._w1.scale = None
-        self.quant_config._w2.scale = None
-        replace_parameter(layer, "w13_weight_scale", None)
-        replace_parameter(layer, "w2_weight_scale", None)
 
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
