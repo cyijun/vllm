@@ -1263,31 +1263,6 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
         )
 
 
-def _swizzle_mxfp4_scale_for_b12x(scale: torch.Tensor) -> torch.Tensor:
-    """Convert linear [expert, row, K/32] scales to B12X 128x4 storage."""
-    if scale.ndim != 3:
-        raise ValueError(f"expected a 3-D MXFP4 scale tensor, got {scale.shape}")
-
-    num_experts, rows, cols = scale.shape
-    rows_padded = round_up(rows, 128)
-    cols_padded = round_up(cols, 4)
-    padded = scale.new_zeros((num_experts, rows_padded, cols_padded))
-    padded[:, :rows, :cols] = scale
-    return (
-        padded.reshape(
-            num_experts,
-            rows_padded // 128,
-            4,
-            32,
-            cols_padded // 4,
-            4,
-        )
-        .permute(0, 1, 4, 3, 2, 5)
-        .contiguous()
-        .reshape(num_experts, rows_padded, cols_padded)
-    )
-
-
 def convert_weight_to_mxfp4_moe_kernel_format(
     mxfp4_backend: Mxfp4MoeBackend,
     layer: torch.nn.Module,
@@ -1338,8 +1313,11 @@ def convert_weight_to_mxfp4_moe_kernel_format(
         if w13_bias is not None or w2_bias is not None:
             raise ValueError("FlashInfer B12X MXFP4 does not support expert bias")
 
-        # Checkpoints store the fused projection as [gate, up]. B12X consumes
-        # [up, gate], with one scale byte per block of 32 input elements.
+        # Checkpoints store the fused projection as [gate, up]. The FlashInfer
+        # W4A16 preparer consumes logical W13 order [up, gate] and rotates it
+        # into the kernel-native layout while repacking the weights. Keep the
+        # native linear E8M0 K/32 scales here; W4A16 preparation owns their
+        # runtime layout conversion.
         gate_weight, up_weight = w13_weight.data.chunk(2, dim=1)
         gate_scale, up_scale = w13_weight_scale.data.chunk(2, dim=1)
         w13_weight = torch.cat((up_weight, gate_weight), dim=1).contiguous()
@@ -1348,8 +1326,8 @@ def convert_weight_to_mxfp4_moe_kernel_format(
         return (
             w13_weight,
             w2_weight.data,
-            _swizzle_mxfp4_scale_for_b12x(w13_weight_scale),
-            _swizzle_mxfp4_scale_for_b12x(w2_weight_scale.data),
+            w13_weight_scale,
+            w2_weight_scale.data,
             None,
             None,
         )

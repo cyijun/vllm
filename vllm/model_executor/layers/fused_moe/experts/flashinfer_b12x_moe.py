@@ -46,11 +46,13 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
     single kernel call.  Input quantization (BF16→FP4) is performed inside the
     kernel so BF16 hidden states are passed directly.
 
-    Weight scale factors are converted to the MMA layout produced by
-    ``convert_sf_to_mma_layout`` once during ``process_weights_after_loading``
-    and cached as ``w1_sf_mma`` / ``w2_sf_mma``.
+    NVFP4 weight scale factors are converted to the MMA layout produced by
+    ``convert_sf_to_mma_layout`` once during ``process_weights_after_loading``.
+    Native MXFP4 checkpoints instead use B12X's W4A16 path so the draft model
+    keeps BF16 activations and speculative acceptance is not degraded by an
+    additional activation quantization step.
 
-    NVFP4 and MXFP4 W4A4 quantization are supported.
+    NVFP4 W4A4 and native MXFP4 W4A16 quantization are supported.
     """
 
     _ACTIVATION_MAP: dict[MoEActivation, str] = {
@@ -67,7 +69,11 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
         assert quant_config.quant_dtype in ("nvfp4", "mxfp4"), (
             "FlashInferB12xExperts only supports nvfp4 or mxfp4 quantization."
         )
-        self.quant_mode = quant_config.quant_dtype
+        self.checkpoint_quant_mode = quant_config.quant_dtype
+        self.quant_mode = "w4a16" if self.checkpoint_quant_mode == "mxfp4" else "nvfp4"
+        self.source_format = (
+            "fp4_e8m0_k32" if self.checkpoint_quant_mode == "mxfp4" else "modelopt"
+        )
         self.out_dtype = moe_config.in_dtype
         self.num_local_experts = moe_config.num_local_experts
         self.ep_rank = moe_config.moe_parallel_config.ep_rank
@@ -101,9 +107,10 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
 
         self.w1_sf_mma: torch.Tensor | None = None
         self.w2_sf_mma: torch.Tensor | None = None
+        self._prepared_w4a16: object | None = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if self.quant_mode == "nvfp4":
+        if self.checkpoint_quant_mode == "nvfp4":
             # Absorb NVFP4's per-expert global scale into its block scales.
             layer.w13_weight_scale.data = (
                 layer.w13_weight_scale.float() * layer.w13_weight_scale_2.view(-1, 1, 1)
@@ -127,10 +134,9 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
                 )
             self._w1_alpha = self.g1_alphas
             self._w2_alpha = self.g2_alphas
-            sf_vec_size = 16
         else:
             # OCP MXFP4 carries its complete scale in each UE8M0 block-scale
-            # byte; no separate expert alpha or FC2 input scale is used.
+            # byte. B12X W4A16 consumes the linear K/32 scale grid directly.
             ones = torch.ones(
                 self.num_local_experts,
                 device=layer.w13_weight.device,
@@ -139,40 +145,55 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             self._w1_alpha = ones
             self._w2_alpha = ones
             self._fc2_input_scale = None
-            sf_vec_size = 32
+            assert self.w1_scale is not None and self.w2_scale is not None
+            self.w1_sf_mma = self.w1_scale
+            self.w2_sf_mma = self.w2_scale
+            # Native MXFP4 tensors already have exactly the storage required by
+            # the W4A16 runtime layout. Repack them in place once during model
+            # loading so every forward hits FlashInfer's prepared-weight cache
+            # without retaining a second copy of the draft expert weights.
+            from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dispatch import (
+                _get_w4a16_packed_weights,
+            )
+
+            self._prepared_w4a16 = _get_w4a16_packed_weights(
+                w1_weight=layer.w13_weight,
+                w1_weight_sf=self.w1_sf_mma,
+                w1_alpha=self._w1_alpha,
+                w2_weight=layer.w2_weight,
+                w2_weight_sf=self.w2_sf_mma,
+                w2_alpha=self._w2_alpha,
+                activation=self._activation_str,
+                params_dtype=self.out_dtype,
+                source_format=self.source_format,
+                reuse_input_storage=True,
+            )
+            return
 
         # Precompute MMA-layout views of the weight scale factors once here
         # rather than recomputing on every forward pass.
         assert self.w1_scale is not None
         num_experts_w1, m1_padded, k1_sf_padded = self.w1_scale.shape
-        if self.quant_mode == "mxfp4":
-            m1 = layer.w13_weight.shape[1]
-            k1 = layer.w13_weight.shape[2] * 2
-        else:
-            m1 = m1_padded
-            k1 = k1_sf_padded * sf_vec_size
+        m1 = m1_padded
+        k1 = k1_sf_padded * 16
         self.w1_sf_mma = flashinfer_convert_sf_to_mma_layout(
             self.w1_scale.reshape(num_experts_w1 * m1_padded, k1_sf_padded),
             m=m1,
             k=k1,
             num_groups=num_experts_w1,
-            sf_vec_size=sf_vec_size,
+            sf_vec_size=16,
         )
 
         assert self.w2_scale is not None
         num_experts_w2, m2_padded, k2_sf_padded = self.w2_scale.shape
-        if self.quant_mode == "mxfp4":
-            m2 = layer.w2_weight.shape[1]
-            k2 = layer.w2_weight.shape[2] * 2
-        else:
-            m2 = m2_padded
-            k2 = k2_sf_padded * sf_vec_size
+        m2 = m2_padded
+        k2 = k2_sf_padded * 16
         self.w2_sf_mma = flashinfer_convert_sf_to_mma_layout(
             self.w2_scale.reshape(num_experts_w2 * m2_padded, k2_sf_padded),
             m=m2,
             k=k2,
             num_groups=num_experts_w2,
-            sf_vec_size=sf_vec_size,
+            sf_vec_size=16,
         )
 
     @staticmethod
@@ -309,4 +330,5 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             activation=self._activation_str,
             swiglu_limit=self.swiglu_limit,
             quant_mode=self.quant_mode,
+            source_format=self.source_format,
         )

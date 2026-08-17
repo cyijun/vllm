@@ -280,7 +280,7 @@ def test_flashinfer_b12x_functional_adapter_cuda_graph(workspace_init):
 
 @torch.inference_mode()
 def test_flashinfer_b12x_mxfp4_moe(workspace_init):
-    """Checkpoint-layout MXFP4 weights run through the B12X W4A4 path."""
+    """Checkpoint-layout MXFP4 weights run through the B12X W4A16 path."""
     m, n, k, e, topk = 8, 128, 256, 8, 2
     dtype = torch.bfloat16
     set_random_seed(19)
@@ -344,6 +344,11 @@ def test_flashinfer_b12x_mxfp4_moe(workspace_init):
         )
         experts = FlashInferB12xExperts(moe_config, quant_config)
         experts.process_weights_after_loading(layer)
+        assert experts._prepared_w4a16 is not None
+        assert experts._prepared_w4a16.w13.data_ptr() == w13_q.data_ptr()
+        assert experts._prepared_w4a16.w2.data_ptr() == w2_q.data_ptr()
+        assert experts._prepared_w4a16.w13_scale.data_ptr() == w13_scale.data_ptr()
+        assert experts._prepared_w4a16.w2_scale.data_ptr() == w2_scale.data_ptr()
         kernel = mk.FusedMoEKernel(
             maybe_make_prepare_finalize(
                 moe=moe_config,
@@ -377,7 +382,9 @@ def test_flashinfer_b12x_mxfp4_moe(workspace_init):
             topk,
         )
 
-        assert experts.quant_mode == "mxfp4"
+        assert experts.checkpoint_quant_mode == "mxfp4"
+        assert experts.quant_mode == "w4a16"
+        assert experts.source_format == "fp4_e8m0_k32"
         torch.testing.assert_close(b12x_output, reference, atol=2e-1, rtol=2e-1)
 
         graph_output = torch.empty_like(hidden_states)
