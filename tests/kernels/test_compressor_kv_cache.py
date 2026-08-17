@@ -34,6 +34,7 @@ from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
     compress_norm_rope_store_triton,
 )
 from vllm.models.deepseek_v4.compressor import _get_c128_boundary
+from vllm.models.deepseek_v4.nvidia.ops import nvfp4_mla as nvfp4_mla_ops
 from vllm.models.deepseek_v4.nvidia.ops.nvfp4_mla import (
     _gather_dequant_nvfp4_rows,
     nvfp4_mla_sparse_attention,
@@ -106,7 +107,8 @@ def test_get_c128_boundary(starts, query_start_loc, expected):
     assert _get_c128_boundary(metadata) is expected
 
 
-def test_nvfp4_mla_sparse_attention_matches_dequantized_cache():
+@pytest.mark.parametrize("num_queries", [2, 17])
+def test_nvfp4_mla_sparse_attention_matches_dequantized_cache(num_queries):
     torch.manual_seed(11)
     backing = torch.zeros(5, 256, 288, dtype=torch.uint8, device="cuda")
     cache = backing[1:]
@@ -114,11 +116,17 @@ def test_nvfp4_mla_sparse_attention_matches_dequantized_cache():
     slots = torch.tensor([0, 257, 513, 769], dtype=torch.int64, device="cuda")
     store_nvfp4_mla_cache(kv, slots, cache)
 
-    indices = torch.tensor(
+    index_rows = torch.tensor(
         [[0, 257, -1], [513, 769, -1]], dtype=torch.int32, device="cuda"
     )
-    lengths = torch.tensor([2, 2], dtype=torch.int32, device="cuda")
-    query = torch.randn(2, 3, 512, dtype=torch.bfloat16, device="cuda")
+    indices = index_rows.repeat((num_queries + 1) // 2, 1)[:num_queries]
+    lengths = torch.full((num_queries,), 2, dtype=torch.int32, device="cuda")
+    if num_queries == 17:
+        # Exercise a fully empty sparse-attention row as well as fallback
+        # chunking across the 16-row memory-safety boundary.
+        indices[-1].fill_(-1)
+        lengths[-1] = 0
+    query = torch.randn(num_queries, 3, 512, dtype=torch.bfloat16, device="cuda")
     output = torch.empty_like(query)
     nvfp4_mla_sparse_attention(
         query,
@@ -136,7 +144,48 @@ def test_nvfp4_mla_sparse_attention_matches_dequantized_cache():
     weights = torch.softmax(scores, dim=-1).masked_fill(~valid[:, None, :], 0)
     expected = torch.einsum("thk,tkd->thd", weights, dequant).to(output.dtype)
 
-    torch.testing.assert_close(output, expected, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(output, expected, rtol=2e-2, atol=4e-2)
+
+
+def test_fused_nvfp4_mla_dual_cache_matches_fallback(monkeypatch):
+    torch.manual_seed(19)
+    num_queries = 17
+    block_size = 256
+    cache = torch.zeros(3, block_size, 288, dtype=torch.uint8, device="cuda")
+    kv = torch.randn(640, 512, dtype=torch.bfloat16, device="cuda") * 3
+    slots = torch.arange(640, dtype=torch.int64, device="cuda")
+    store_nvfp4_mla_cache(kv, slots, cache)
+
+    query = torch.randn(num_queries, 16, 512, dtype=torch.bfloat16, device="cuda")
+    swa_indices = torch.arange(128, dtype=torch.int32, device="cuda").repeat(
+        num_queries, 1
+    )
+    extra_indices = torch.arange(128, 640, dtype=torch.int32, device="cuda").repeat(
+        num_queries, 1
+    )
+    swa_lens = torch.full((num_queries,), 128, dtype=torch.int32, device="cuda")
+    extra_lens = torch.full((num_queries,), 512, dtype=torch.int32, device="cuda")
+    sinks = torch.linspace(-2, 2, 16, dtype=torch.float32, device="cuda")
+
+    actual = torch.empty_like(query)
+    reference = torch.empty_like(query)
+    kwargs = dict(
+        query=query,
+        swa_cache=cache,
+        swa_indices=swa_indices,
+        swa_lens=swa_lens,
+        sm_scale=512**-0.5,
+        sinks=sinks,
+        extra_cache=cache,
+        extra_indices=extra_indices,
+        extra_lens=extra_lens,
+    )
+    monkeypatch.setattr(nvfp4_mla_ops, "_NVFP4_MLA_USE_FUSED_KERNEL", True)
+    nvfp4_mla_sparse_attention(output=actual, **kwargs)
+    monkeypatch.setattr(nvfp4_mla_ops, "_NVFP4_MLA_USE_FUSED_KERNEL", False)
+    nvfp4_mla_sparse_attention(output=reference, **kwargs)
+
+    torch.testing.assert_close(actual, reference, rtol=2e-2, atol=4e-2)
 
 
 def test_fp8_paged_mqa_logits_fallback_matches_quantized_cache():

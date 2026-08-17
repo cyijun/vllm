@@ -14,6 +14,202 @@ NVFP4_MLA_BLOCK_SIZE = 16
 NVFP4_MLA_DATA_BYTES = NVFP4_MLA_HEAD_DIM // 2
 NVFP4_MLA_SCALE_BYTES = NVFP4_MLA_HEAD_DIM // NVFP4_MLA_BLOCK_SIZE
 NVFP4_MLA_TOKEN_BYTES = NVFP4_MLA_DATA_BYTES + NVFP4_MLA_SCALE_BYTES
+# Bound the PyTorch fallback's temporary [query, sparse_width, head_dim]
+# tensors explicitly: a single 8K-token prefill can otherwise request tens of
+# GiB on unified-memory systems before the allocator reports a useful error.
+NVFP4_MLA_FALLBACK_MAX_QUERY_ROWS = 16
+_NVFP4_MLA_USE_FUSED_KERNEL = True
+
+
+@triton.jit
+def _dequant_nvfp4_mla_rows(
+    cache_ptr,
+    row_indices,
+    row_valid,
+    dim_offsets,
+    cache_block_stride,
+    cache_block_size,
+    DATA_BYTES: tl.constexpr,
+    SCALE_BYTES: tl.constexpr,
+):
+    """Load a candidate tile from the block-planar vLLM NVFP4 cache."""
+    safe_indices = tl.maximum(row_indices, 0)
+    block_indices = safe_indices // cache_block_size
+    block_offsets = safe_indices % cache_block_size
+
+    packed_offsets = dim_offsets // 2
+    packed = tl.load(
+        cache_ptr
+        + block_indices[:, None] * cache_block_stride
+        + block_offsets[:, None] * DATA_BYTES
+        + packed_offsets[None, :],
+        mask=row_valid[:, None],
+        other=0,
+    ).to(tl.uint32)
+    shift = (dim_offsets & 1) * 4
+    code = (packed >> shift[None, :]) & 0xF
+    magnitude = code & 0x7
+    exponent = magnitude >> 1
+    mantissa = magnitude & 1
+    normal = (1.0 + mantissa.to(tl.float32) * 0.5) * tl.exp2(
+        exponent.to(tl.float32) - 1.0
+    )
+    fp4 = tl.where(exponent == 0, mantissa.to(tl.float32) * 0.5, normal)
+    fp4 = tl.where((code & 0x8) != 0, -fp4, fp4)
+
+    scale_offsets = dim_offsets // 16
+    scale_raw = tl.load(
+        cache_ptr
+        + block_indices[:, None] * cache_block_stride
+        + cache_block_size * DATA_BYTES
+        + block_offsets[:, None] * SCALE_BYTES
+        + scale_offsets[None, :],
+        mask=row_valid[:, None],
+        other=0,
+    ).to(tl.uint8)
+    scale = scale_raw.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+    return fp4 * scale
+
+
+@triton.jit
+def _nvfp4_mla_sparse_attention_kernel(
+    query_ptr,
+    swa_cache_ptr,
+    swa_indices_ptr,
+    swa_lens_ptr,
+    extra_cache_ptr,
+    extra_indices_ptr,
+    extra_lens_ptr,
+    sinks_ptr,
+    output_ptr,
+    query_stride_t,
+    query_stride_h,
+    swa_cache_block_stride,
+    swa_cache_block_size,
+    swa_indices_stride_t,
+    extra_cache_block_stride,
+    extra_cache_block_size,
+    extra_indices_stride_t,
+    output_stride_t,
+    output_stride_h,
+    num_heads: tl.constexpr,
+    sm_scale: tl.constexpr,
+    SWA_WIDTH: tl.constexpr,
+    EXTRA_WIDTH: tl.constexpr,
+    HAS_EXTRA: tl.constexpr,
+    HAS_SINKS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    head_offsets = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+    dim_offsets = tl.arange(0, HEAD_DIM)
+    head_valid = head_offsets < num_heads
+
+    q = tl.load(
+        query_ptr
+        + token_idx * query_stride_t
+        + head_offsets[:, None] * query_stride_h
+        + dim_offsets[None, :],
+        mask=head_valid[:, None],
+        other=0.0,
+    )
+    acc = tl.zeros((BLOCK_H, HEAD_DIM), tl.float32)
+    row_max = tl.full((BLOCK_H,), -float("inf"), tl.float32)
+    row_sum = tl.zeros((BLOCK_H,), tl.float32)
+    log2_scale = sm_scale * 1.4426950408889634
+
+    swa_len = tl.load(swa_lens_ptr + token_idx).to(tl.int32)
+    for candidate_start in tl.range(0, SWA_WIDTH, BLOCK_N):
+        candidate_offsets = candidate_start + tl.arange(0, BLOCK_N)
+        candidate_valid = candidate_offsets < tl.minimum(swa_len, SWA_WIDTH)
+        candidate_indices = tl.load(
+            swa_indices_ptr + token_idx * swa_indices_stride_t + candidate_offsets,
+            mask=candidate_offsets < SWA_WIDTH,
+            other=-1,
+        ).to(tl.int32)
+        candidate_valid &= candidate_indices >= 0
+        kv = _dequant_nvfp4_mla_rows(
+            swa_cache_ptr,
+            candidate_indices,
+            candidate_valid,
+            dim_offsets,
+            swa_cache_block_stride,
+            swa_cache_block_size,
+            256,
+            32,
+        ).to(tl.bfloat16)
+        scores = tl.dot(q, tl.trans(kv), out_dtype=tl.float32) * log2_scale
+        scores = tl.where(candidate_valid[None, :], scores, -float("inf"))
+        tile_max = tl.max(scores, axis=1)
+        has_candidates = tl.sum(candidate_valid.to(tl.int32), axis=0) > 0
+        next_max = tl.where(has_candidates, tl.maximum(row_max, tile_max), row_max)
+        alpha = tl.where(has_candidates, tl.exp2(row_max - next_max), 1.0)
+        probabilities = tl.exp2(scores - next_max[:, None])
+        probabilities = tl.where(candidate_valid[None, :], probabilities, 0.0)
+        acc = acc * alpha[:, None] + tl.dot(
+            probabilities.to(tl.bfloat16), kv, out_dtype=tl.float32
+        )
+        row_sum = row_sum * alpha + tl.sum(probabilities, axis=1)
+        row_max = next_max
+
+    if HAS_EXTRA:
+        extra_len = tl.load(extra_lens_ptr + token_idx).to(tl.int32)
+        for candidate_start in tl.range(0, EXTRA_WIDTH, BLOCK_N):
+            candidate_offsets = candidate_start + tl.arange(0, BLOCK_N)
+            candidate_valid = candidate_offsets < tl.minimum(extra_len, EXTRA_WIDTH)
+            candidate_indices = tl.load(
+                extra_indices_ptr
+                + token_idx * extra_indices_stride_t
+                + candidate_offsets,
+                mask=candidate_offsets < EXTRA_WIDTH,
+                other=-1,
+            ).to(tl.int32)
+            candidate_valid &= candidate_indices >= 0
+            kv = _dequant_nvfp4_mla_rows(
+                extra_cache_ptr,
+                candidate_indices,
+                candidate_valid,
+                dim_offsets,
+                extra_cache_block_stride,
+                extra_cache_block_size,
+                256,
+                32,
+            ).to(tl.bfloat16)
+            scores = tl.dot(q, tl.trans(kv), out_dtype=tl.float32) * log2_scale
+            scores = tl.where(candidate_valid[None, :], scores, -float("inf"))
+            tile_max = tl.max(scores, axis=1)
+            has_candidates = tl.sum(candidate_valid.to(tl.int32), axis=0) > 0
+            next_max = tl.where(has_candidates, tl.maximum(row_max, tile_max), row_max)
+            alpha = tl.where(has_candidates, tl.exp2(row_max - next_max), 1.0)
+            probabilities = tl.exp2(scores - next_max[:, None])
+            probabilities = tl.where(candidate_valid[None, :], probabilities, 0.0)
+            acc = acc * alpha[:, None] + tl.dot(
+                probabilities.to(tl.bfloat16), kv, out_dtype=tl.float32
+            )
+            row_sum = row_sum * alpha + tl.sum(probabilities, axis=1)
+            row_max = next_max
+
+    if HAS_SINKS:
+        sink = tl.load(sinks_ptr + head_offsets, mask=head_valid, other=-float("inf"))
+        sink *= 1.4426950408889634
+        sink_valid = sink != -float("inf")
+        next_max = tl.where(sink_valid, tl.maximum(row_max, sink), row_max)
+        alpha = tl.where(sink_valid, tl.exp2(row_max - next_max), 1.0)
+        acc *= alpha[:, None]
+        sink_weight = tl.where(sink_valid, tl.exp2(sink - next_max), 0.0)
+        row_sum = row_sum * alpha + sink_weight
+
+    result = tl.where(row_sum[:, None] > 0, acc / row_sum[:, None], 0.0)
+    tl.store(
+        output_ptr
+        + token_idx * output_stride_t
+        + head_offsets[:, None] * output_stride_h
+        + dim_offsets[None, :],
+        result,
+        mask=head_valid[:, None],
+    )
 
 
 @triton.jit
@@ -159,6 +355,88 @@ def nvfp4_mla_sparse_attention(
     extra_indices: torch.Tensor | None = None,
     extra_lens: torch.Tensor | None = None,
 ) -> None:
+    if _NVFP4_MLA_USE_FUSED_KERNEL and query.is_cuda:
+        if query.shape[0] == 0:
+            return
+        if query.shape[-1] != NVFP4_MLA_HEAD_DIM:
+            raise ValueError(
+                f"NVFP4 MLA query head dim must be {NVFP4_MLA_HEAD_DIM}, "
+                f"got {query.shape[-1]}"
+            )
+        if query.dtype != torch.bfloat16 or output.dtype != torch.bfloat16:
+            raise TypeError("fused NVFP4 MLA requires bf16 query and output")
+        swa_indices = swa_indices.reshape(query.shape[0], -1).contiguous()
+        swa_lens = swa_lens.contiguous()
+        if extra_cache is not None:
+            if extra_indices is None or extra_lens is None:
+                raise ValueError("extra NVFP4 MLA cache requires indices and lengths")
+            extra_indices = extra_indices.reshape(query.shape[0], -1).contiguous()
+            extra_cache_arg = extra_cache
+            extra_indices_arg = extra_indices
+            extra_lens_arg = extra_lens.contiguous()
+            extra_width = extra_indices.shape[1]
+        else:
+            extra_cache_arg = swa_cache
+            extra_indices_arg = swa_indices
+            extra_lens_arg = swa_lens
+            extra_width = 0
+        sinks_arg = sinks if sinks is not None else swa_lens
+        block_h = 16
+        num_warps = 8 if query.shape[0] <= 6 else 4
+        grid = (query.shape[0], triton.cdiv(query.shape[1], block_h))
+        _nvfp4_mla_sparse_attention_kernel[grid](
+            query,
+            swa_cache,
+            swa_indices,
+            swa_lens,
+            extra_cache_arg,
+            extra_indices_arg,
+            extra_lens_arg,
+            sinks_arg,
+            output,
+            query.stride(0),
+            query.stride(1),
+            swa_cache.stride(0),
+            swa_cache.shape[1],
+            swa_indices.stride(0),
+            extra_cache_arg.stride(0),
+            extra_cache_arg.shape[1],
+            extra_indices_arg.stride(0),
+            output.stride(0),
+            output.stride(1),
+            num_heads=query.shape[1],
+            sm_scale=sm_scale,
+            SWA_WIDTH=swa_indices.shape[1],
+            EXTRA_WIDTH=extra_width,
+            HAS_EXTRA=extra_cache is not None,
+            HAS_SINKS=sinks is not None,
+            HEAD_DIM=NVFP4_MLA_HEAD_DIM,
+            BLOCK_H=block_h,
+            BLOCK_N=16,
+            num_warps=num_warps,
+            num_stages=1,
+        )
+        return
+
+    if query.shape[0] > NVFP4_MLA_FALLBACK_MAX_QUERY_ROWS:
+        for start in range(0, query.shape[0], NVFP4_MLA_FALLBACK_MAX_QUERY_ROWS):
+            end = min(start + NVFP4_MLA_FALLBACK_MAX_QUERY_ROWS, query.shape[0])
+            nvfp4_mla_sparse_attention(
+                query=query[start:end],
+                swa_cache=swa_cache,
+                swa_indices=swa_indices[start:end],
+                swa_lens=swa_lens[start:end],
+                output=output[start:end],
+                sm_scale=sm_scale,
+                sinks=sinks,
+                extra_cache=extra_cache,
+                extra_indices=(
+                    extra_indices[start:end] if extra_indices is not None else None
+                ),
+                extra_lens=extra_lens[start:end] if extra_lens is not None else None,
+            )
+        return
+
     swa_indices = swa_indices.reshape(query.shape[0], -1)
     values = [_gather_dequant_nvfp4_rows(swa_cache, swa_indices)]
     valid = [
