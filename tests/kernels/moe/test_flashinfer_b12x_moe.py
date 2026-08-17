@@ -83,6 +83,7 @@ def _process_b12x_weights(
 
 
 def test_flashinfer_b12x_functional_call_receives_swiglu_limit(monkeypatch):
+    monkeypatch.delenv("VLLM_B12X_NVFP4_W4A16", raising=False)
     captured = {}
 
     def fake_b12x_fused_moe(**kwargs):
@@ -138,6 +139,110 @@ def test_flashinfer_b12x_functional_call_receives_swiglu_limit(monkeypatch):
     assert captured["swiglu_limit"] == 10.0
     assert captured["output"] is output
     assert captured["quant_mode"] == "nvfp4"
+
+
+@torch.inference_mode()
+def test_flashinfer_b12x_nvfp4_w4a16_reuses_weight_storage(monkeypatch):
+    """The opt-in packs ModelOpt NVFP4 in place and runs BF16 activations."""
+    monkeypatch.setenv("VLLM_B12X_NVFP4_W4A16", "1")
+    m, n, k, e, topk = 6, 128, 256, 8, 2
+    dtype = torch.bfloat16
+    set_random_seed(23)
+
+    with set_current_vllm_config(
+        VllmConfig(parallel_config=ParallelConfig(pipeline_parallel_size=1))
+    ):
+        hidden_states = torch.randn((m, k), device="cuda", dtype=dtype) / 10
+        # The B12X source contract is [up; gate], matching vLLM's post-load
+        # [w3; w1] reorder.
+        w13_bf16 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 15
+        w2_bf16 = torch.randn((e, k, n), device="cuda", dtype=dtype) / 15
+        global_scale = torch.ones(1, device="cuda", dtype=torch.float32)
+        w13_q_flat, w13_sf_flat = fp4_quantize(
+            w13_bf16.reshape(e * 2 * n, k),
+            global_scale=global_scale,
+            sf_vec_size=16,
+            is_sf_swizzled_layout=True,
+        )
+        w2_q_flat, w2_sf_flat = fp4_quantize(
+            w2_bf16.reshape(e * k, n),
+            global_scale=global_scale,
+            sf_vec_size=16,
+            is_sf_swizzled_layout=True,
+        )
+        w13_q = w13_q_flat.view(e, 2 * n, k // 2)
+        w2_q = w2_q_flat.view(e, k, n // 2)
+        w13_sf = w13_sf_flat.view(e, 2 * n, w13_sf_flat.shape[1])
+        w2_sf = w2_sf_flat.view(e, k, w2_sf_flat.shape[1])
+        ones_e = torch.ones(e, device="cuda", dtype=torch.float32)
+        layer = SimpleNamespace(
+            w13_weight=w13_q,
+            w2_weight=w2_q,
+            w13_weight_scale=w13_sf,
+            w2_weight_scale=w2_sf,
+            w13_weight_scale_2=ones_e.clone(),
+            w2_weight_scale_2=ones_e.clone(),
+        )
+        quant_config = nvfp4_moe_quant_config(
+            g1_alphas=layer.w13_weight_scale_2,
+            g2_alphas=layer.w2_weight_scale_2,
+            a1_gscale=ones_e,
+            a2_gscale=ones_e,
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+        )
+        moe_config = make_dummy_moe_config(
+            num_experts=e,
+            experts_per_token=topk,
+            hidden_dim=k,
+            intermediate_size=n,
+            in_dtype=dtype,
+            swiglu_limit=10.0,
+        )
+        experts = FlashInferB12xExperts(moe_config, quant_config)
+        w13_ptr = w13_q.data_ptr()
+        w2_ptr = w2_q.data_ptr()
+        source_scale_elements = w13_sf.numel() + w2_sf.numel()
+        experts.process_weights_after_loading(layer)
+
+        assert experts.quant_mode == "w4a16"
+        assert experts._prepared_w4a16 is not None
+        assert experts._prepared_w4a16.w13.data_ptr() == w13_ptr
+        assert experts._prepared_w4a16.w2.data_ptr() == w2_ptr
+        assert layer.w13_weight_scale.data_ptr() == (
+            experts._prepared_w4a16.w13_scale.data_ptr()
+        )
+        assert layer.w2_weight_scale.data_ptr() == (
+            experts._prepared_w4a16.w2_scale.data_ptr()
+        )
+        assert (
+            layer.w13_weight_scale.numel() + layer.w2_weight_scale.numel()
+            == source_scale_elements
+        )
+
+        score = torch.randn((m, e), device="cuda", dtype=dtype)
+        topk_weights, topk_ids, _ = fused_topk(
+            hidden_states, score, topk, renormalize=False
+        )
+        output = torch.empty_like(hidden_states)
+        experts.apply(
+            output=output,
+            hidden_states=hidden_states,
+            w1=w13_q,
+            w2=w2_q,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation=MoEActivation.SILU,
+            global_num_experts=e,
+            expert_map=None,
+            a1q_scale=None,
+            a2_scale=None,
+            workspace13=None,
+            workspace2=None,
+            expert_tokens_meta=None,
+            apply_router_weight_on_input=False,
+        )
+        assert torch.isfinite(output).all()
 
 
 def test_flashinfer_b12x_sanitizes_padding_routes():

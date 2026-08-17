@@ -3,6 +3,7 @@
 
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
@@ -48,9 +49,11 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
 
     NVFP4 weight scale factors are converted to the MMA layout produced by
     ``convert_sf_to_mma_layout`` once during ``process_weights_after_loading``.
-    Native MXFP4 checkpoints instead use B12X's W4A16 path so the draft model
-    keeps BF16 activations and speculative acceptance is not degraded by an
-    additional activation quantization step.
+    Native MXFP4 checkpoints use B12X's W4A16 path so the draft model keeps
+    BF16 activations. ModelOpt NVFP4 checkpoints can opt into the same packed
+    W4A16 execution path with ``VLLM_B12X_NVFP4_W4A16=1``. The opt-in repacks
+    weights in place and replaces the source block scales, so it is fixed for
+    the lifetime of the loaded model.
 
     NVFP4 W4A4 and native MXFP4 W4A16 quantization are supported.
     """
@@ -70,7 +73,14 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             "FlashInferB12xExperts only supports nvfp4 or mxfp4 quantization."
         )
         self.checkpoint_quant_mode = quant_config.quant_dtype
-        self.quant_mode = "w4a16" if self.checkpoint_quant_mode == "mxfp4" else "nvfp4"
+        self._nvfp4_w4a16 = (
+            self.checkpoint_quant_mode == "nvfp4" and envs.VLLM_B12X_NVFP4_W4A16
+        )
+        self.quant_mode = (
+            "w4a16"
+            if self.checkpoint_quant_mode == "mxfp4" or self._nvfp4_w4a16
+            else "nvfp4"
+        )
         self.source_format = (
             "fp4_e8m0_k32" if self.checkpoint_quant_mode == "mxfp4" else "modelopt"
         )
@@ -110,6 +120,49 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
         self._prepared_w4a16: object | None = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self._nvfp4_w4a16:
+            assert self.w1_scale is not None and self.w2_scale is not None
+            assert self.g1_alphas is not None and self.g2_alphas is not None
+
+            # vLLM has already converted the linear K/16 ModelOpt scales to
+            # FlashInfer's swizzled source layout. Pack both projections into
+            # the B12X W4A16 MMA layout, reusing the FP4 weight storage so the
+            # full model never keeps a second expert-weight copy.
+            from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_prepare import (  # noqa: E501
+                prepare_w4a16_packed_weights,
+            )
+
+            prepared = prepare_w4a16_packed_weights(
+                layer.w13_weight,
+                self.w1_scale,
+                self.g1_alphas,
+                layer.w2_weight,
+                self.w2_scale,
+                self.g2_alphas,
+                activation=self._activation_str,
+                params_dtype=self.out_dtype,
+                source_format=self.source_format,
+                w13_layout="w13",
+                reuse_input_storage=True,
+            )
+            self._prepared_w4a16 = prepared
+
+            # Rebind the existing Parameters so the source-layout scales are
+            # released layer by layer instead of retaining a second full scale
+            # grid across the model. The quant config references the same
+            # Parameter objects, so its views stay synchronized.
+            layer.w13_weight_scale.data = prepared.w13_scale
+            layer.w2_weight_scale.data = prepared.w2_scale
+            layer.w13_weight_scale_2.data = prepared.w13_global_scale
+            layer.w2_weight_scale_2.data = prepared.w2_global_scale
+
+            self.w1_sf_mma = layer.w13_weight_scale
+            self.w2_sf_mma = layer.w2_weight_scale
+            self._w1_alpha = layer.w13_weight_scale_2
+            self._w2_alpha = layer.w2_weight_scale_2
+            self._fc2_input_scale = None
+            return
+
         if self.checkpoint_quant_mode == "nvfp4":
             # Absorb NVFP4's per-expert global scale into its block scales.
             layer.w13_weight_scale.data = (
@@ -310,6 +363,34 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
         # a process-wide CUDA Event here: every layer executes in order on the
         # current stream, while recording the same event repeatedly inside
         # multiple captured graphs creates invalid cross-graph dependencies.
+        if self._nvfp4_w4a16:
+            assert self._prepared_w4a16 is not None
+            from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dispatch import (  # noqa: E501
+                launch_sm120_moe,
+            )
+
+            launch_sm120_moe(
+                a=hidden_states,
+                topk_ids=token_selected_experts,
+                topk_weights=token_final_scales,
+                w1_weight=w1,
+                w1_weight_sf=self.w1_sf_mma,
+                w1_alpha=self._w1_alpha,
+                w2_weight=w2,
+                w2_weight_sf=self.w2_sf_mma,
+                w2_alpha=self._w2_alpha,
+                num_experts=self.global_num_experts,
+                top_k=self.topk,
+                num_local_experts=self.num_local_experts,
+                scatter_output=output,
+                activation=self._activation_str,
+                swiglu_limit=self.swiglu_limit,
+                quant_mode="w4a16",
+                source_format=self.source_format,
+                _prepared_weights=self._prepared_w4a16,
+            )
+            return
+
         from flashinfer.fused_moe import b12x_fused_moe
 
         b12x_fused_moe(
