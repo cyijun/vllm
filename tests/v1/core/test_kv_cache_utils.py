@@ -2154,7 +2154,7 @@ def test_deepseek_v4_nvfp4_mla_page_size_and_merge():
         DeepseekV4FlashMLAMetadataBuilder.get_cudagraph_support(
             SimpleNamespace(), full_spec
         )
-        == AttentionCGSupport.NEVER
+        == AttentionCGSupport.UNIFORM_BATCH
     )
     assert swa_spec.real_page_size_bytes == 16 * 288
     merged = SlidingWindowMLASpec.merge([swa_spec, swa_spec])

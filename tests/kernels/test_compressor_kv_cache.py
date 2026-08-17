@@ -192,6 +192,53 @@ def test_fused_nvfp4_mla_dual_cache_matches_fallback(monkeypatch):
     torch.testing.assert_close(actual, reference, rtol=2e-2, atol=4e-2)
 
 
+def test_fused_nvfp4_mla_cuda_graph_replay():
+    torch.manual_seed(23)
+    num_queries = 2
+    block_size = 256
+    cache = torch.zeros(3, block_size, 288, dtype=torch.uint8, device="cuda")
+    kv = torch.randn(640, 512, dtype=torch.bfloat16, device="cuda") * 3
+    slots = torch.arange(640, dtype=torch.int64, device="cuda")
+    store_nvfp4_mla_cache(kv, slots, cache)
+
+    query = torch.randn(num_queries, 16, 512, dtype=torch.bfloat16, device="cuda")
+    swa_indices = torch.arange(128, dtype=torch.int32, device="cuda").repeat(
+        num_queries, 1
+    )
+    extra_indices = torch.arange(128, 640, dtype=torch.int32, device="cuda").repeat(
+        num_queries, 1
+    )
+    swa_lens = torch.full((num_queries,), 128, dtype=torch.int32, device="cuda")
+    extra_lens = torch.full((num_queries,), 512, dtype=torch.int32, device="cuda")
+    sinks = torch.linspace(-2, 2, 16, dtype=torch.float32, device="cuda")
+    output = torch.empty_like(query)
+    kwargs = dict(
+        query=query,
+        swa_cache=cache,
+        swa_indices=swa_indices,
+        swa_lens=swa_lens,
+        output=output,
+        sm_scale=512**-0.5,
+        sinks=sinks,
+        extra_cache=cache,
+        extra_indices=extra_indices,
+        extra_lens=extra_lens,
+    )
+
+    nvfp4_mla_sparse_attention(**kwargs)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        nvfp4_mla_sparse_attention(**kwargs)
+
+    query.copy_(torch.randn_like(query))
+    graph.replay()
+    actual = output.clone()
+    expected = torch.empty_like(query)
+    nvfp4_mla_sparse_attention(**(kwargs | {"output": expected}))
+
+    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=4e-2)
+
+
 def test_fp8_paged_mqa_logits_fallback_matches_quantized_cache():
     batch_size, num_heads, head_dim = 2, 3, 128
     block_size = 16
