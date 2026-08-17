@@ -77,9 +77,6 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             vllm_config=draft_vllm_config, model_config=draft_model_config
         )
 
-    if get_pp_group().world_size != 1:
-        raise NotImplementedError("DSpark does not support pipeline parallelism.")
-
     target_language_model = (
         target_model.get_language_model()
         if hasattr(target_model, "get_language_model")
@@ -88,14 +85,17 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     target_inner = target_language_model.model
     draft_inner = draft_model.model
 
-    target_embed = getattr(target_inner, "embed_tokens", None)
-    draft_embed = getattr(draft_inner, "embed_tokens", None)
-    if target_embed is not None and _should_share(
-        draft_model, "has_own_embed_tokens", draft_embed, target_embed
-    ):
-        if draft_embed is not None:
-            del draft_inner.embed_tokens
-        draft_inner.embed_tokens = target_embed
+    # Only the first PP stage owns the target embedding, while the draft runs
+    # on the last stage. Keep the draft's locally loaded copy under PP.
+    if get_pp_group().world_size == 1:
+        target_embed = getattr(target_inner, "embed_tokens", None)
+        draft_embed = getattr(draft_inner, "embed_tokens", None)
+        if target_embed is not None and _should_share(
+            draft_model, "has_own_embed_tokens", draft_embed, target_embed
+        ):
+            if draft_embed is not None:
+                del draft_inner.embed_tokens
+            draft_inner.embed_tokens = target_embed
 
     target_lm_head = get_target_lm_head(target_model, target_language_model)
     draft_lm_head = getattr(draft_model, "lm_head", None)

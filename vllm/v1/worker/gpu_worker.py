@@ -790,9 +790,17 @@ class Worker(WorkerBase):
 
             maybe_save_startup_plan(self, kv_cache_memory_bytes_to_requested_limit)
 
-        if self.use_v2_model_runner:
+        if (
+            self.use_v2_model_runner
+            and self.parallel_config.pipeline_parallel_size == 1
+        ):
             # V2: Run full execute_model + sample_tokens to JIT compile triton kernels.
             warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
+        elif self.use_v2_model_runner:
+            logger.info(
+                "Skipping V2 request warmup under pipeline parallelism; workers "
+                "must not advance execute/sample loops independently."
+            )
         elif get_pp_group().is_last_rank:
             # V1: Warm up sampler and preallocate memory buffer for logits and other
             # sampling related tensors of max possible shape to avoid memory

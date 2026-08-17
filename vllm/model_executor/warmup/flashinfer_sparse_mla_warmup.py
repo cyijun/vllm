@@ -224,6 +224,12 @@ def deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
     runner = worker.model_runner
     if runner.is_pooling_model or not _has_deepseek_v4_sparse_mla_backend(runner):
         return
+    if runner.vllm_config.parallel_config.pipeline_parallel_size > 1:
+        logger.info(
+            "Skipping DeepSeek V4 sparse MLA mixed warmup under pipeline "
+            "parallelism; the startup dummy request does not drive the PP scheduler."
+        )
+        return
 
     max_tokens = worker.scheduler_config.max_num_batched_tokens
     mixed_tokens = _clamp_warmup_tokens(_SPARSE_MLA_MIXED_WARMUP_TOKENS, max_tokens)

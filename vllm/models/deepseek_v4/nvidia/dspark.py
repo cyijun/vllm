@@ -18,6 +18,7 @@ import torch.nn as nn
 import vllm.envs as envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
+    get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
@@ -47,6 +48,7 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_padding_mask,
     sp_shard,
 )
+from vllm.sequence import IntermediateTensors
 
 from .model import (
     DeepseekV4DecoderLayer,
@@ -307,6 +309,8 @@ def _insert_context_kv(
 
 
 class DSparkDeepseekV4ForCausalLM(nn.Module):
+    supports_pp = True
+
     # Draft weights ship in the target checkpoint (mtp.*) without embed/head, so
     # load_dspark_model always aliases the target's.
     has_own_embed_tokens = False
@@ -361,10 +365,27 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Returns the pre-norm hc_head hidden ([T, hidden_size]).
         return self.model(input_ids, positions, inputs_embeds)
+
+    def make_empty_intermediate_tensors(
+        self,
+        batch_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> IntermediateTensors:
+        return IntermediateTensors(
+            {
+                "hidden_states": torch.zeros(
+                    (batch_size, self.config.hidden_size),
+                    dtype=dtype,
+                    device=device,
+                )
+            }
+        )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Base logits U_k = lm_head(norm(head_hidden))."""
@@ -429,6 +450,14 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         head_end = n_local_head * (tp_rank + 1)
 
         for name, loaded_weight in weights:
+            # Under PP the draft only runs on the last stage, which does not own
+            # the target embedding. Load a local copy before filtering for mtp.*.
+            if get_pp_group().world_size > 1 and name == "embed.weight":
+                param_name = "model.embed_tokens.weight"
+                param = params_dict[param_name]
+                param.weight_loader(param, loaded_weight)
+                loaded_params.add(param_name)
+                continue
             mapped = self._remap_dspark_name(name)
             if mapped is None:
                 continue
