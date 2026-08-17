@@ -29,10 +29,11 @@ def _reset_graph_pool_id():
     pynccl_allocator._graph_pool_id = None
 
 
-def _create_vllm_config() -> MagicMock:
+def _create_vllm_config(eager_sizes: list[int] | None = None) -> MagicMock:
     compilation_config = CompilationConfig(
         cudagraph_mode="FULL",
         cudagraph_capture_sizes=[4],
+        cudagraph_eager_sizes=eager_sizes or [],
     )
     compilation_config.max_cudagraph_capture_size = 4
     compilation_config.post_init_cudagraph_sizes()
@@ -44,6 +45,14 @@ def _create_vllm_config() -> MagicMock:
     vllm_config.speculative_config = None
     vllm_config.num_speculative_tokens = 0
     return vllm_config
+
+
+def test_cudagraph_eager_sizes_validation():
+    config = CompilationConfig(cudagraph_eager_sizes=[12, 6, 12])
+    assert config.cudagraph_eager_sizes == [6, 12]
+
+    with pytest.raises(ValueError, match="must be positive"):
+        CompilationConfig(cudagraph_eager_sizes=[0])
 
 
 def test_full_capture_sets_graph_pool_id_before_cuda_graph(monkeypatch):
@@ -109,3 +118,47 @@ def test_full_capture_sets_graph_pool_id_before_cuda_graph(monkeypatch):
         manager.capture(create_forward_fn)
 
     mock_cuda_graph.assert_called_once()
+
+
+def test_eager_size_bypasses_cudagraph_padding(monkeypatch):
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(
+        gpu_cudagraph_utils.current_platform,
+        "get_global_graph_pool",
+        lambda: None,
+    )
+    manager = gpu_cudagraph_utils.CudaGraphManager(
+        vllm_config=_create_vllm_config(eager_sizes=[3]),
+        device=torch.device("cpu"),
+        cudagraph_mode=CUDAGraphMode.FULL,
+        decode_query_len=1,
+    )
+    manager._graphs_captured = True
+
+    eager_desc = manager.dispatch(
+        num_reqs=3,
+        num_tokens=3,
+        uniform_token_count=1,
+        num_active_loras=0,
+    )
+    graph_desc = manager.dispatch(
+        num_reqs=2,
+        num_tokens=2,
+        uniform_token_count=1,
+        num_active_loras=0,
+    )
+
+    assert eager_desc == BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.NONE,
+        num_tokens=3,
+        num_reqs=3,
+    )
+    assert graph_desc == BatchExecutionDescriptor(
+        cg_mode=CUDAGraphMode.FULL,
+        num_tokens=4,
+        num_reqs=4,
+    )

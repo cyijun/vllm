@@ -119,6 +119,7 @@ class CudaGraphManager:
         self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.compilation_config = vllm_config.compilation_config
         assert self.compilation_config is not None
+        self._eager_sizes = frozenset(self.compilation_config.cudagraph_eager_sizes)
         self.cudagraph_mode = cudagraph_mode
         self.decode_query_len = decode_query_len
 
@@ -372,6 +373,13 @@ class CudaGraphManager:
         """Find matching cudagraph descriptor from priority-ordered candidates."""
 
         effective_loras = self._resolve_effective_loras(num_active_loras)
+        if num_tokens in self._eager_sizes:
+            return BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.NONE,
+                num_tokens=num_tokens,
+                num_reqs=num_reqs,
+                num_active_loras=effective_loras,
+            )
         key = (num_tokens, effective_loras)
         if self._graphs_captured and num_tokens > 0 and key in self._candidates:
             for desc in self._candidates[key]:

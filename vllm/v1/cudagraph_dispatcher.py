@@ -275,6 +275,7 @@ class CudagraphDispatcher:
             not self.keys_initialized
             or self.cudagraph_mode == CUDAGraphMode.NONE
             or max_size is None
+            or num_tokens in self.compilation_config.cudagraph_eager_sizes
             or num_tokens > max_size
             or allowed_modes <= {CUDAGraphMode.NONE}
         ):

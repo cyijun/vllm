@@ -267,6 +267,32 @@ class TestCudagraphDispatcher:
 
         assert dispatcher.get_capture_descs() == []
 
+    def test_eager_size_bypasses_cudagraph_padding(self):
+        comp_config = CompilationConfig(
+            cudagraph_mode="FULL",
+            mode=CompilationMode.NONE,
+            cudagraph_capture_sizes=[4],
+            cudagraph_eager_sizes=[3],
+        )
+        config = _create_vllm_config(comp_config, max_num_seqs=4)
+        dispatcher = CudagraphDispatcher(config)
+        dispatcher.initialize_cudagraph_keys(
+            cudagraph_mode=comp_config.cudagraph_mode,
+            uniform_decode_query_len=1,
+        )
+
+        eager_mode, eager_desc = dispatcher.dispatch(num_tokens=3)
+        graph_mode, graph_desc = dispatcher.dispatch(num_tokens=2)
+
+        assert eager_mode == CUDAGraphMode.NONE
+        assert eager_desc == BatchDescriptor(num_tokens=3)
+        assert graph_mode == CUDAGraphMode.FULL
+        assert graph_desc == BatchDescriptor(
+            num_tokens=4,
+            num_reqs=4,
+            uniform=False,
+        )
+
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Skip if not cuda")
 class TestCUDAGraphWrapper:

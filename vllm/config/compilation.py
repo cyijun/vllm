@@ -417,6 +417,8 @@ class CompilationConfig:
         - [`cudagraph_mode`][vllm.config.CompilationConfig.cudagraph_mode]
         - [`cudagraph_capture_sizes`]
         [vllm.config.CompilationConfig.cudagraph_capture_sizes]
+        - [`cudagraph_eager_sizes`]
+        [vllm.config.CompilationConfig.cudagraph_eager_sizes]
         - [`max_cudagraph_capture_size`]
         [vllm.config.CompilationConfig.max_cudagraph_capture_size]
         - [`cudagraph_num_of_warmups`]
@@ -649,6 +651,9 @@ class CompilationConfig:
     """Sizes to capture cudagraph.
     - None (default): capture sizes are inferred from vllm config.
     - list[int]: capture sizes are specified as given."""
+    cudagraph_eager_sizes: list[int] = field(default_factory=list)
+    """Exact token counts that must execute eagerly instead of being padded to
+    and replayed through a captured CUDA graph."""
     cudagraph_copy_inputs: bool = False
     """Whether to copy input tensors for
     cudagraph. If the caller can guarantee that the same input buffers
@@ -1007,6 +1012,13 @@ class CompilationConfig:
             raise ValueError(
                 "custom_ops can contain only one base mode: 'all' or 'none'"
             )
+
+        if any(size <= 0 for size in self.cudagraph_eager_sizes):
+            raise ValueError(
+                "All cudagraph_eager_sizes must be positive, got "
+                f"{self.cudagraph_eager_sizes}"
+            )
+        self.cudagraph_eager_sizes = sorted(set(self.cudagraph_eager_sizes))
 
         enabled_ops = {op[1:] for op in self.custom_ops if op.startswith("+")}
         disabled_ops = {op[1:] for op in self.custom_ops if op.startswith("-")}

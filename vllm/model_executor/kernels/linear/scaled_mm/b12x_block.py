@@ -17,32 +17,8 @@ from .BlockScaledMMLinearKernel import (
 )
 
 
-def _triton_block_fp8(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    As: torch.Tensor,
-    Bs: torch.Tensor,
-    weight_group_shape: GroupShape,
-    out_dtype: torch.dtype,
-) -> torch.Tensor:
-    return torch.ops.vllm.w8a8_triton_block_scaled_mm_func(
-        A,
-        B,
-        As,
-        Bs,
-        list(weight_group_shape),
-        out_dtype,
-    )
-
-
 class B12xFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
     """K128 block-FP8 linear through the native B12X SM12x GEMM."""
-
-    # Capturing the complete DeepSeek V4 decode graph at M=12 can leave the
-    # B12X block-FP8 op with an illegal-access error on SM121.  The same GEMM
-    # shapes are stable through vLLM's Triton implementation.  Keep the B12X
-    # fast path for every other M, including the common C1/C4/C6 shapes.
-    _TRITON_FALLBACK_M = frozenset((12,))
 
     @classmethod
     def is_supported(
@@ -136,15 +112,6 @@ class B12xFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         As: torch.Tensor,
         Bs: torch.Tensor,
     ) -> torch.Tensor:
-        if A.shape[0] in self._TRITON_FALLBACK_M:
-            return _triton_block_fp8(
-                A,
-                B,
-                As,
-                Bs,
-                self.weight_group_shape,
-                self.config.out_dtype,
-            )
         blockscaled = get_b12x_blockscaled()
         assert blockscaled is not None
         return blockscaled.mm_block_fp8(
