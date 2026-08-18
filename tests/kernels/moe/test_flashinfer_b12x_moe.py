@@ -44,6 +44,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.experts.flashinfer_b12x_moe import (
     FlashInferB12xExperts,
+    _b12x_route_pack_token_capacities,
     _sanitize_b12x_topk,
 )
 from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
@@ -64,6 +65,18 @@ MNK_FACTORS = [
     (16, 128, 256),
     (64, 256, 512),
 ]
+
+
+@pytest.mark.parametrize(
+    ("max_tokens", "expected"),
+    [
+        (1, (1,)),
+        (6, (1, 2, 4, 8)),
+        (512, tuple(1 << shift for shift in range(10))),
+    ],
+)
+def test_b12x_route_pack_token_capacities(max_tokens, expected):
+    assert _b12x_route_pack_token_capacities(max_tokens) == expected
 
 
 def _process_b12x_weights(
@@ -145,6 +158,12 @@ def test_flashinfer_b12x_functional_call_receives_swiglu_limit(monkeypatch):
 def test_flashinfer_b12x_nvfp4_w4a16_reuses_weight_storage(monkeypatch):
     """The opt-in packs ModelOpt NVFP4 in place and runs BF16 activations."""
     monkeypatch.setenv("VLLM_B12X_NVFP4_W4A16", "1")
+    prewarm_calls = []
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.fused_moe.experts.flashinfer_b12x_moe."
+        "_prewarm_b12x_route_pack",
+        lambda **kwargs: prewarm_calls.append(kwargs),
+    )
     m, n, k, e, topk = 6, 128, 256, 8, 2
     dtype = torch.bfloat16
     set_random_seed(23)
@@ -219,6 +238,14 @@ def test_flashinfer_b12x_nvfp4_w4a16_reuses_weight_storage(monkeypatch):
             layer.w13_weight_scale.numel() + layer.w2_weight_scale.numel()
             == source_scale_elements
         )
+        assert prewarm_calls == [
+            {
+                "device": layer.w13_weight.device,
+                "num_experts": e,
+                "topk": topk,
+                "max_tokens": moe_config.max_num_tokens,
+            }
+        ]
 
         score = torch.randn((m, e), device="cuda", dtype=dtype)
         topk_weights, topk_ids, _ = fused_topk(

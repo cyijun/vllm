@@ -5,6 +5,7 @@ import torch
 
 import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -26,6 +27,91 @@ from vllm.utils.flashinfer import (
     flashinfer_convert_sf_to_mma_layout,
     has_flashinfer_b12x_moe,
 )
+
+logger = init_logger(__name__)
+
+
+_B12X_ROUTE_PACK_WARMED: set[tuple[str, int, int, int, int]] = set()
+
+
+def _b12x_route_pack_token_capacities(max_tokens: int) -> tuple[int, ...]:
+    """Return every power-of-two route-pack capacity through ``max_tokens``."""
+    max_tokens = max(int(max_tokens), 1)
+    max_capacity = 1 << (max_tokens - 1).bit_length()
+    return tuple(1 << shift for shift in range(max_capacity.bit_length()))
+
+
+def _prewarm_b12x_route_pack(
+    *,
+    device: torch.device,
+    num_experts: int,
+    topk: int,
+    max_tokens: int,
+) -> None:
+    """Resolve every reachable B12X route-pack specialization."""
+    device = torch.device(device)
+    if device.type != "cuda":
+        raise RuntimeError(f"B12X route-pack warmup requires CUDA, got {device}")
+
+    num_experts = max(int(num_experts), 1)
+    topk = max(int(topk), 1)
+    capacities = _b12x_route_pack_token_capacities(max_tokens)
+
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_host import (
+        select_route_block_size_m,
+    )
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_kernel import (
+        pack_topk_routes_by_expert,
+    )
+
+    with torch.accelerator.device_index(device.index):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "B12X route-pack warmup must run before CUDA graph capture"
+            )
+        device_index = int(torch.accelerator.current_device_index())
+        cache_key = (
+            device.type,
+            device_index,
+            num_experts,
+            topk,
+            capacities[-1],
+        )
+        if cache_key in _B12X_ROUTE_PACK_WARMED:
+            return
+
+        topk_ids = torch.zeros(
+            (capacities[-1], topk),
+            dtype=torch.int32,
+            device=device,
+        )
+        for token_capacity in capacities:
+            block_size = select_route_block_size_m(
+                token_capacity,
+                topk,
+                num_experts,
+            )
+            live_token_counts = (
+                (token_capacity, token_capacity - 1)
+                if token_capacity > 2
+                else (token_capacity,)
+            )
+            for live_tokens in live_token_counts:
+                pack_topk_routes_by_expert(
+                    topk_ids[:live_tokens],
+                    block_size,
+                    num_experts,
+                )
+        torch.accelerator.synchronize(device)
+        _B12X_ROUTE_PACK_WARMED.add(cache_key)
+
+    logger.info(
+        "Prewarmed B12X route-pack capacities %s on cuda:%d (experts=%d, topk=%d)",
+        capacities,
+        device_index,
+        num_experts,
+        topk,
+    )
 
 
 def _sanitize_b12x_topk(
@@ -103,6 +189,7 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             moe_config.intermediate_size_per_partition
         )
         self.max_num_tokens = moe_config.max_num_tokens
+        self._route_pack_max_tokens = int(moe_config.max_num_tokens)
         self.local_expert_offset = self.ep_rank * self.num_local_experts
         self.swiglu_limit = moe_config.swiglu_limit
 
@@ -161,6 +248,12 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             self._w1_alpha = layer.w13_weight_scale_2
             self._w2_alpha = layer.w2_weight_scale_2
             self._fc2_input_scale = None
+            _prewarm_b12x_route_pack(
+                device=layer.w13_weight.device,
+                num_experts=self.global_num_experts,
+                topk=self.topk,
+                max_tokens=self._route_pack_max_tokens,
+            )
             return
 
         if self.checkpoint_quant_mode == "nvfp4":
@@ -220,6 +313,12 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
                 params_dtype=self.out_dtype,
                 source_format=self.source_format,
                 reuse_input_storage=True,
+            )
+            _prewarm_b12x_route_pack(
+                device=layer.w13_weight.device,
+                num_experts=self.global_num_experts,
+                topk=self.topk,
+                max_tokens=self._route_pack_max_tokens,
             )
             return
 
