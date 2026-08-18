@@ -13,6 +13,7 @@ from vllm.models.deepseek_v4.common.ops import (
     dequantize_and_gather_k_cache,
 )
 from vllm.models.deepseek_v4.nvidia.ops.o_proj import (
+    b12x_bf16_o_proj,
     compute_fp8_einsum_recipe,
     deep_gemm_fp8_o_proj,
 )
@@ -41,6 +42,15 @@ class DeepseekV4FlashMLAAttention(DeepseekV4Attention):
         self._einsum_recipe, self._tma_aligned_scales = compute_fp8_einsum_recipe()
 
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        if getattr(self.wo_a, "b12x_bf16_bmm", False):
+            return b12x_bf16_o_proj(
+                o,
+                positions,
+                self.rotary_emb,
+                self.wo_a,
+                self.wo_b,
+                n_groups=self.n_local_groups,
+            )
         return deep_gemm_fp8_o_proj(
             o,
             positions,

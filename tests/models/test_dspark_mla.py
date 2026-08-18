@@ -12,6 +12,7 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.models.qwen3_dspark import DSparkMarkovHead
 from vllm.model_executor.models.registry import ModelRegistry
 from vllm.models.deepseek_v4.nvidia import dspark as deepseek_v4_dspark
+from vllm.models.deepseek_v4.nvidia import flashmla as deepseek_v4_flashmla
 from vllm.models.deepseek_v4.nvidia.ops import nvfp4_mla
 from vllm.models.deepseek_v4.quant_config import DeepseekV4FP8Config
 from vllm.models.kimi_k3.nvidia import dspark_mla
@@ -215,3 +216,44 @@ def test_deepseek_v4_quant_config_can_restore_native_mxfp4_moe():
     quant_config.use_native_mxfp4_moe()
 
     assert quant_config.moe_quant_algo == ""
+
+
+@pytest.mark.cpu_test
+def test_deepseek_v4_flashmla_uses_b12x_bf16_o_proj(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    o = torch.randn(2, 4, 8)
+    positions = torch.arange(2)
+    expected = torch.randn(2, 16)
+    rotary_emb = object()
+    wo_a = SimpleNamespace(b12x_bf16_bmm=True)
+    wo_b = object()
+    attention = SimpleNamespace(
+        rotary_emb=rotary_emb,
+        wo_a=wo_a,
+        wo_b=wo_b,
+        n_local_groups=2,
+    )
+    calls = []
+
+    def record_b12x_bf16_o_proj(*args, **kwargs):
+        calls.append((args, kwargs))
+        return expected
+
+    monkeypatch.setattr(
+        deepseek_v4_flashmla,
+        "b12x_bf16_o_proj",
+        record_b12x_bf16_o_proj,
+    )
+    monkeypatch.setattr(
+        deepseek_v4_flashmla,
+        "deep_gemm_fp8_o_proj",
+        lambda *args, **kwargs: pytest.fail("B12X BF16 fallback was bypassed"),
+    )
+
+    actual = deepseek_v4_flashmla.DeepseekV4FlashMLAAttention._o_proj(
+        attention, o, positions
+    )
+
+    assert actual is expected
+    assert calls == [((o, positions, rotary_emb, wo_a, wo_b), {"n_groups": 2})]
