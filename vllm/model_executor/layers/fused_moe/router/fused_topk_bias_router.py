@@ -184,6 +184,8 @@ def fused_topk_bias(
     input_tokens: torch.Tensor | None = None,
     hash_indices_table: torch.Tensor | None = None,
     routed_scaling_factor: float = 1.0,
+    num_fused_shared_experts: int = 0,
+    shared_expert_weight: float = 1.0,
 ):
     if (
         input_tokens is not None
@@ -206,11 +208,19 @@ def fused_topk_bias(
             output_indices_dtype,
         ):
             assert e_score_correction_bias is not None
+            # The fast kernel already carries eight output lanes: six routed
+            # experts plus at most two shared experts. Larger shared-expert
+            # sets retain the generic append path below.
+            fused_shared_experts = (
+                num_fused_shared_experts if num_fused_shared_experts <= 2 else 0
+            )
             return dsv4_topk(
                 gating_output,
                 e_score_correction_bias,
                 output_indices_dtype,
                 routed_scaling_factor,
+                fused_shared_experts,
+                shared_expert_weight,
             )
 
         M, _ = hidden_states.size()
@@ -419,9 +429,12 @@ class FusedTopKBiasRouter(BaseRouter):
             input_tokens=input_ids,
             hash_indices_table=self._hash_indices_table,
             routed_scaling_factor=self.routed_scaling_factor,
+            num_fused_shared_experts=self.num_fused_shared_experts,
+            shared_expert_weight=self.shared_expert_weight,
         )
 
-        if self.num_fused_shared_experts > 0:
+        expected_topk = self.top_k + self.num_fused_shared_experts
+        if self.num_fused_shared_experts > 0 and topk_ids.shape[-1] != expected_topk:
             m = topk_ids.shape[0]
             n = self.num_fused_shared_experts
             # global_num_experts counts only the routed experts; the fused

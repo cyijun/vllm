@@ -7,6 +7,7 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 _TOPK = 6
+_MAX_FUSED_SHARED_EXPERTS = 2
 
 # Adapted from:
 # https://github.com/sgl-project/sglang/blob/main/python/sglang/jit_kernel/moe_fused_gate.py
@@ -44,7 +45,10 @@ if current_platform.is_cuda():
         topk_weights_ptr,
         topk_ids_ptr,
         routed_scaling_factor,
+        shared_expert_weight,
         NUM_EXPERTS: tl.constexpr,
+        NUM_FUSED_SHARED_EXPERTS: tl.constexpr,
+        OUTPUT_TOPK: tl.constexpr,
         BLOCK_N: tl.constexpr,
         launch_pdl: tl.constexpr,
     ):
@@ -86,8 +90,18 @@ if current_platform.is_cuda():
         selected_weights *= routed_scaling_factor / tl.where(
             weight_sum > 0.0, weight_sum, 1.0
         )
-        output_mask = topk_offsets < 6
-        output_offsets = row * 6 + topk_offsets
+        for shared_idx in tl.static_range(2):
+            is_shared_slot = topk_offsets == 6 + shared_idx
+            if shared_idx < NUM_FUSED_SHARED_EXPERTS:
+                selected_weights = tl.where(
+                    is_shared_slot, shared_expert_weight, selected_weights
+                )
+                selected_ids = tl.where(
+                    is_shared_slot, NUM_EXPERTS + shared_idx, selected_ids
+                )
+
+        output_mask = topk_offsets < OUTPUT_TOPK
+        output_offsets = row * OUTPUT_TOPK + topk_offsets
 
         if launch_pdl:
             tl.extra.cuda.gdc_launch_dependents()
@@ -101,9 +115,18 @@ def dsv4_topk(
     correction_bias: torch.Tensor,
     indices_dtype: torch.dtype,
     routed_scaling_factor: float,
+    num_fused_shared_experts: int = 0,
+    shared_expert_weight: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if not 0 <= num_fused_shared_experts <= _MAX_FUSED_SHARED_EXPERTS:
+        raise ValueError(
+            "DeepSeek V4 fast top-k supports between 0 and "
+            f"{_MAX_FUSED_SHARED_EXPERTS} fused shared experts, got "
+            f"{num_fused_shared_experts}"
+        )
     num_tokens, num_experts = gating_output.shape
-    shape = (num_tokens, _TOPK)
+    output_topk = _TOPK + num_fused_shared_experts
+    shape = (num_tokens, output_topk)
     topk_weights = gating_output.new_empty(shape, dtype=torch.float32)
     topk_ids = gating_output.new_empty(shape, dtype=indices_dtype)
     if num_tokens > 0:
@@ -113,7 +136,10 @@ def dsv4_topk(
             topk_weights,
             topk_ids,
             routed_scaling_factor,
+            shared_expert_weight,
             NUM_EXPERTS=num_experts,
+            NUM_FUSED_SHARED_EXPERTS=num_fused_shared_experts,
+            OUTPUT_TOPK=output_topk,
             BLOCK_N=triton.next_power_of_2(num_experts),
             num_warps=1,
             launch_pdl=current_platform.is_arch_support_pdl(),

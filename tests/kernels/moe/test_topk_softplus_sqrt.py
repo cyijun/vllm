@@ -13,6 +13,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.router.dsv4_topk import dsv4_topk
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
+    FusedTopKBiasRouter,
     fused_topk_bias,
 )
 from vllm.platforms import current_platform
@@ -232,6 +233,80 @@ def test_dsv4_fast_topk(
         atol=2e-5,
         rtol=2e-5,
     )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(),
+    reason="The DeepSeek V4 fast path is CUDA-only.",
+)
+@pytest.mark.parametrize("num_fused_shared_experts", [1, 2])
+@pytest.mark.parametrize("indices_type", [torch.int32, torch.int64])
+def test_dsv4_fast_topk_fuses_shared_experts(
+    num_fused_shared_experts: int,
+    indices_type: torch.dtype,
+):
+    torch.manual_seed(0)
+    num_tokens = 17
+    num_experts = 256
+    shared_expert_weight = 0.75
+    gating_output = torch.randn(
+        (num_tokens, num_experts), dtype=torch.float32, device="cuda"
+    )
+    correction_bias = torch.randn(num_experts, dtype=torch.float32, device="cuda")
+
+    routed_weights_ref, routed_ids_ref = _torch_topk_softplus_sqrt(
+        gating_output=gating_output,
+        topk=6,
+        renormalize=True,
+        routed_scaling_factor=1.5,
+        e_score_correction_bias=correction_bias,
+    )
+    topk_weights, topk_ids = dsv4_topk(
+        gating_output,
+        correction_bias,
+        indices_type,
+        1.5,
+        num_fused_shared_experts,
+        shared_expert_weight,
+    )
+
+    torch.testing.assert_close(
+        routed_ids_ref.to(indices_type), topk_ids[:, :6], atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        routed_weights_ref, topk_weights[:, :6], atol=2e-5, rtol=2e-5
+    )
+    expected_shared_ids = torch.arange(
+        num_experts,
+        num_experts + num_fused_shared_experts,
+        dtype=indices_type,
+        device="cuda",
+    ).expand(num_tokens, -1)
+    torch.testing.assert_close(topk_ids[:, 6:], expected_shared_ids, atol=0, rtol=0)
+    torch.testing.assert_close(
+        topk_weights[:, 6:],
+        torch.full_like(topk_weights[:, 6:], shared_expert_weight),
+        atol=0,
+        rtol=0,
+    )
+
+    router = FusedTopKBiasRouter(
+        top_k=6,
+        global_num_experts=num_experts,
+        e_score_correction_bias=correction_bias,
+        renormalize=True,
+        routed_scaling_factor=1.5,
+        scoring_func="sqrtsoftplus",
+        num_fused_shared_experts=num_fused_shared_experts,
+        shared_expert_weight=shared_expert_weight,
+    )
+    router_weights, router_ids = router._compute_routing(
+        torch.empty((num_tokens, 1), dtype=torch.bfloat16, device="cuda"),
+        gating_output,
+        indices_type,
+    )
+    torch.testing.assert_close(router_ids, topk_ids, atol=0, rtol=0)
+    torch.testing.assert_close(router_weights, topk_weights, atol=0, rtol=0)
 
 
 @pytest.mark.skipif(
