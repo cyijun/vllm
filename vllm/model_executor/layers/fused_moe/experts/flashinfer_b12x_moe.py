@@ -39,6 +39,11 @@ logger = init_logger(__name__)
 _B12X_ROUTE_PACK_WARMED: set[tuple[str, int, int, int, int]] = set()
 
 
+def _uses_legacy_b12x_runtime() -> bool:
+    """Whether the installed package exposes Anemll's 0.15.3 TP-MoE API."""
+    return importlib.metadata.version("b12x") == "0.15.3"
+
+
 def _apply_b12x_w4a16_ultrawide_compile_compat() -> None:
     """Keep b12x 1.2.4's valid M=1 ultra-wide tile self-consistent.
 
@@ -157,6 +162,43 @@ def _standalone_b12x_execution_plan(
             quant_mode="w4a16",
             apply_router_weight_on_input=False,
             swiglu_limit=swiglu_limit,
+            frozen=True,
+        )
+    )
+
+
+@functools.lru_cache
+def _legacy_b12x_execution_plan(
+    *,
+    max_tokens: int,
+    num_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    topk: int,
+    device: str,
+    activation: str,
+    params_dtype: torch.dtype,
+    swiglu_limit: float | None,
+):
+    """Plan caller-owned scratch for Anemll's b12x 0.15.3 runtime."""
+    from b12x.integration.tp_moe import TPMoEScratchCaps, plan_tp_moe_scratch
+
+    return plan_tp_moe_scratch(
+        TPMoEScratchCaps(
+            max_tokens=max(int(max_tokens), 1),
+            weight_E=num_experts,
+            k=hidden_size,
+            n=intermediate_size,
+            num_topk=topk,
+            device=device,
+            dtype=params_dtype,
+            core_token_counts=(max(int(max_tokens), 1),),
+            route_num_experts=0,
+            quant_mode="w4a16",
+            activation=activation,
+            swiglu_limit=swiglu_limit,
+            source_format="fp4_e8m0_k32",
+            w13_layout="w13",
             frozen=True,
         )
     )
@@ -287,12 +329,16 @@ def _prewarm_b12x_route_pack(
     topk = max(int(topk), 1)
     capacities = _b12x_route_pack_token_capacities(max_tokens)
 
-    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_host import (
-        select_route_block_size_m,
-    )
-    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_kernel import (
-        pack_topk_routes_by_expert,
-    )
+    if _uses_legacy_b12x_runtime():
+        from b12x.moe.fused.w4a16.host import select_route_block_size_m
+        from b12x.moe.fused.w4a16.route_pack import pack_topk_routes_by_expert
+    else:
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_host import (
+            select_route_block_size_m,
+        )
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_kernel import (
+            pack_topk_routes_by_expert,
+        )
 
     with torch.accelerator.device_index(device.index):
         if torch.cuda.is_current_stream_capturing():
@@ -411,6 +457,9 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
         self._standalone_mxfp4 = (
             self.checkpoint_quant_mode == "mxfp4" and envs.VLLM_B12X_STANDALONE_MXFP4
         )
+        self._legacy_standalone_mxfp4 = (
+            self._standalone_mxfp4 and _uses_legacy_b12x_runtime()
+        )
         self.quant_mode = (
             "w4a16"
             if self.checkpoint_quant_mode == "mxfp4" or self._nvfp4_w4a16
@@ -454,11 +503,59 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
         self.w1_sf_mma: torch.Tensor | None = None
         self.w2_sf_mma: torch.Tensor | None = None
         self._prepared_w4a16: object | None = None
+        self._legacy_b12x_prepared: object | None = None
         self._standalone_b12x_experts: object | None = None
         self._standalone_b12x_device: torch.device | None = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if self._standalone_mxfp4:
+            if self._legacy_standalone_mxfp4:
+                from b12x.integration import prepare_b12x_fp4_moe_weights
+
+                unit_scale = torch.ones(
+                    self.num_local_experts,
+                    device=layer.w13_weight.device,
+                    dtype=torch.float32,
+                )
+                prepared = prepare_b12x_fp4_moe_weights(
+                    source_format=self.source_format,
+                    w13_layout="w13",
+                    w1_fp4=layer.w13_weight,
+                    w1_blockscale=layer.w13_weight_scale,
+                    w1_global_scale=unit_scale,
+                    a1_gscale=unit_scale,
+                    w2_fp4=layer.w2_weight,
+                    w2_blockscale=layer.w2_weight_scale,
+                    w2_global_scale=unit_scale,
+                    a2_gscale=unit_scale,
+                    activation=self._activation_str,
+                    params_dtype=self.out_dtype,
+                    prepare_runtime_alphas=False,
+                    prepare_w4a16=True,
+                    reuse_input_storage=True,
+                )
+                if prepared.w4a16 is None:
+                    raise RuntimeError("b12x 0.15.3 did not prepare W4A16 weights")
+                self._legacy_b12x_prepared = prepared
+                self._prepared_w4a16 = prepared.w4a16
+                self._standalone_b12x_device = layer.w13_weight.device
+                self._w1_alpha = unit_scale
+                self._w2_alpha = unit_scale
+                self.w1_sf_mma = layer.w13_weight_scale
+                self.w2_sf_mma = layer.w2_weight_scale
+                self._fc2_input_scale = None
+                _prewarm_b12x_route_pack(
+                    device=layer.w13_weight.device,
+                    num_experts=self.global_num_experts,
+                    topk=self.topk,
+                    max_tokens=self._route_pack_max_tokens,
+                )
+                logger.info(
+                    "Prepared standalone MXFP4 weights with b12x 0.15.3 "
+                    "packed W4A16 runtime"
+                )
+                return
+
             from b12x.moe import fused_moe
 
             _apply_b12x_w4a16_ultrawide_compile_compat()
@@ -702,7 +799,12 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
                 raise RuntimeError(
                     "process_weights_after_loading must initialize standalone b12x"
                 )
-            plan = _standalone_b12x_execution_plan(
+            plan_fn = (
+                _legacy_b12x_execution_plan
+                if self._legacy_standalone_mxfp4
+                else _standalone_b12x_execution_plan
+            )
+            plan = plan_fn(
                 max_tokens=M,
                 num_experts=self.global_num_experts,
                 hidden_size=self.hidden_dim,
@@ -714,11 +816,12 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
                 swiglu_limit=self.swiglu_limit,
             )
             scratch_nbytes = _standalone_b12x_scratch_nbytes(plan)
-            # b12x's route workspace scales with M and can be smaller than an
-            # E-wide count array at decode.  Keep expert counts in a fixed,
-            # caller-owned tail so both eager warmup and CUDA graphs are
-            # allocation-free without depending on b12x's private layout.
-            scratch_nbytes += self.global_num_experts * 4
+            if not self._legacy_standalone_mxfp4:
+                # b12x's route workspace scales with M and can be smaller than
+                # an E-wide count array at decode. Keep expert counts in a
+                # fixed, caller-owned tail for b12x 1.2.4, whose public runner
+                # does not forward that planned buffer for packed W4A16.
+                scratch_nbytes += self.global_num_experts * 4
             element_size = torch.empty((), dtype=self.out_dtype).element_size()
             workspace2 = ((scratch_nbytes + element_size - 1) // element_size,)
             return (1,), workspace2, (M, K)
@@ -776,6 +879,61 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
                     "standalone b12x MXFP4 does not support applying router "
                     "weights on input"
                 )
+            if self._legacy_standalone_mxfp4:
+                assert self._legacy_b12x_prepared is not None
+                assert self._prepared_w4a16 is not None
+                assert self._standalone_b12x_device is not None
+                from b12x.integration.tp_moe import b12x_moe_fp4
+
+                plan = _legacy_b12x_execution_plan(
+                    max_tokens=hidden_states.shape[0],
+                    num_experts=self.global_num_experts,
+                    hidden_size=self.hidden_dim,
+                    intermediate_size=self.intermediate_size_per_partition,
+                    topk=self.topk,
+                    device=str(self._standalone_b12x_device),
+                    activation=self._activation_str,
+                    params_dtype=self.out_dtype,
+                    swiglu_limit=self.swiglu_limit,
+                )
+                if workspace2 is None:
+                    raise RuntimeError(
+                        "standalone b12x MXFP4 requires workspace2 scratch"
+                    )
+                scratch = workspace2.reshape(-1).view(torch.uint8)
+                required_nbytes = _standalone_b12x_scratch_nbytes(plan)
+                if scratch.numel() < required_nbytes:
+                    raise ValueError(
+                        "b12x 0.15.3 MXFP4 workspace2 is too small: "
+                        f"have={scratch.numel()} bytes, need={required_nbytes} bytes"
+                    )
+                binding = plan.bind(
+                    scratch=scratch[:required_nbytes],
+                    a=hidden_states,
+                    a1_gscale=self._w1_alpha,
+                    w1_fp4=w1,
+                    w1_blockscale=self.w1_sf_mma,
+                    w1_alphas=self._w1_alpha,
+                    a2_gscale=self._w2_alpha,
+                    w2_fp4=w2,
+                    w2_blockscale=self.w2_sf_mma,
+                    w2_alphas=self._w2_alpha,
+                    topk_weights=token_final_scales,
+                    topk_ids=token_selected_experts,
+                    output=output,
+                    input_scales_are_reciprocal=True,
+                    input_scales_static=True,
+                    activation=self._activation_str,
+                    quant_mode="w4a16",
+                    unit_scale_contract=True,
+                    source_format=self.source_format,
+                    w13_layout="w13",
+                    prepared_w4a16=self._prepared_w4a16,
+                    swiglu_limit=self.swiglu_limit,
+                )
+                b12x_moe_fp4(binding=binding)
+                return
+
             assert self._standalone_b12x_experts is not None
             assert self._standalone_b12x_device is not None
             from b12x.moe import fused_moe

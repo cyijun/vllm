@@ -482,7 +482,7 @@ def test_flashinfer_b12x_functional_adapter_cuda_graph(workspace_init):
 def test_flashinfer_b12x_mxfp4_moe(workspace_init, monkeypatch, standalone_mxfp4):
     """Checkpoint-layout MXFP4 weights run through the B12X W4A16 path."""
     if standalone_mxfp4:
-        pytest.importorskip("b12x.moe")
+        pytest.importorskip("b12x")
     monkeypatch.setenv("VLLM_B12X_STANDALONE_MXFP4", str(int(standalone_mxfp4)))
     m, n, k, e, topk = 8, 128, 256, 8, 2
     dtype = torch.bfloat16
@@ -643,7 +643,7 @@ def test_flashinfer_b12x_mxfp4_moe(workspace_init, monkeypatch, standalone_mxfp4
 @pytest.mark.parametrize("m", [1, 36])
 def test_flashinfer_b12x_standalone_route_cuda_graph(workspace_init, monkeypatch, m):
     """Decode and packed W4A16 routing use caller-owned count scratch."""
-    pytest.importorskip("b12x.moe")
+    pytest.importorskip("b12x")
     monkeypatch.setenv("VLLM_B12X_STANDALONE_MXFP4", "1")
     n, k, e, topk = 128, 256, 256, 6
     dtype = torch.bfloat16
