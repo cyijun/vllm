@@ -425,9 +425,13 @@ def test_flashinfer_b12x_functional_adapter_cuda_graph(workspace_init):
         torch.testing.assert_close(output, eager_output, atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize("standalone_mxfp4", [False, True])
 @torch.inference_mode()
-def test_flashinfer_b12x_mxfp4_moe(workspace_init):
+def test_flashinfer_b12x_mxfp4_moe(workspace_init, monkeypatch, standalone_mxfp4):
     """Checkpoint-layout MXFP4 weights run through the B12X W4A16 path."""
+    if standalone_mxfp4:
+        pytest.importorskip("b12x.moe")
+    monkeypatch.setenv("VLLM_B12X_STANDALONE_MXFP4", str(int(standalone_mxfp4)))
     m, n, k, e, topk = 8, 128, 256, 8, 2
     dtype = torch.bfloat16
     set_random_seed(19)
@@ -535,6 +539,21 @@ def test_flashinfer_b12x_mxfp4_moe(workspace_init):
         torch.testing.assert_close(b12x_output, reference, atol=2e-1, rtol=2e-1)
 
         graph_output = torch.empty_like(hidden_states)
+        _, graph_workspace_shape, _ = experts.workspace_shapes(
+            m,
+            2 * n,
+            k,
+            topk,
+            e,
+            e,
+            None,
+            MoEActivation.SILU,
+        )
+        graph_workspace = torch.empty(
+            graph_workspace_shape,
+            dtype=dtype,
+            device=hidden_states.device,
+        )
 
         def apply() -> None:
             experts.apply(
@@ -550,7 +569,7 @@ def test_flashinfer_b12x_mxfp4_moe(workspace_init):
                 a1q_scale=None,
                 a2_scale=None,
                 workspace13=None,
-                workspace2=None,
+                workspace2=graph_workspace,
                 expert_tokens_meta=None,
                 apply_router_weight_on_input=False,
             )

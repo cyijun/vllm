@@ -200,6 +200,7 @@ if TYPE_CHECKING:
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
     VLLM_B12X_NVFP4_W4A16: bool = False
+    VLLM_B12X_STANDALONE_MXFP4: bool = False
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
     VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS: list[str] | None = None
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
@@ -1560,6 +1561,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # This repacks the FP4 weights in place during model loading, so it cannot
     # be toggled after the model has been initialized.
     "VLLM_B12X_NVFP4_W4A16": lambda: bool(int(os.getenv("VLLM_B12X_NVFP4_W4A16", "0"))),
+    # Run native MXFP4 expert weights through the standalone b12x planned API.
+    # This is an experimental serving path for comparing b12x's caller-owned
+    # scratch and CUDA-graph lowering with FlashInfer's functional adapter.
+    "VLLM_B12X_STANDALONE_MXFP4": lambda: bool(
+        int(os.getenv("VLLM_B12X_STANDALONE_MXFP4", "0"))
+    ),
     # Control the cache sized used by the xgrammar compiler. The default
     # of 512 MB should be enough for roughly 1000 JSON schemas.
     # It can be changed with this variable if needed for some reason.
