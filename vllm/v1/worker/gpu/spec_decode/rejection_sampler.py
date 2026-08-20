@@ -246,15 +246,39 @@ class RejectionSampler:
             input_batch.idx_mapping_np
         )
         max_chunk_logits = max(1, MAX_CHUNK_BYTES // (logits.shape[1] * _FP32_BYTES))
-        sampled, num_sampled, logprobs_tensors = self._verify_in_chunks(
-            logits,
-            input_batch,
-            draft_logits,
-            draft_sampled,
-            pos,
-            max_chunk_logits,
-            max_num_logprobs,
-        )
+        if logits.shape[0] <= max_chunk_logits:
+            processed_logits, sampled, num_sampled = self._verify(
+                logits,
+                draft_logits,
+                draft_sampled,
+                pos,
+                input_batch.cu_num_logits,
+                input_batch.idx_mapping,
+                input_batch.idx_mapping_np,
+                input_batch.expanded_idx_mapping,
+                input_batch.expanded_local_pos,
+            )
+            use_processed_logits = (
+                self.sampler.logprobs_mode in PROCESSED_LOGPROBS_MODES
+            )
+            logprobs_tensors = self._get_logprobs_tensors(
+                sampled,
+                num_sampled,
+                processed_logits if use_processed_logits else logits,
+                input_batch.cu_num_logits,
+                input_batch.cu_num_logits_np,
+                max_num_logprobs,
+            )
+        else:
+            sampled, num_sampled, logprobs_tensors = self._verify_in_chunks(
+                logits,
+                input_batch,
+                draft_logits,
+                draft_sampled,
+                pos,
+                max_chunk_logits,
+                max_num_logprobs,
+            )
 
         num_sampled, num_rejected = get_num_sampled_and_rejected(
             num_sampled,

@@ -11,6 +11,8 @@ import torch
 from vllm.config.model import PROCESSED_LOGPROBS_MODES, LogprobsMode
 from vllm.platforms import current_platform
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
+    _FP32_BYTES,
+    MAX_CHUNK_BYTES,
     RejectionSampler,
     _iter_request_chunks,
 )
@@ -24,6 +26,95 @@ def test_iter_request_chunks_preserves_request_boundaries():
         (2, 3),
         (3, 4),
     ]
+
+
+@pytest.mark.parametrize(
+    ("logprobs_mode", "use_processed_logits"),
+    [("raw_logprobs", False), ("processed_logprobs", True)],
+)
+def test_single_chunk_avoids_chunk_orchestration(
+    monkeypatch: pytest.MonkeyPatch,
+    logprobs_mode: str,
+    use_processed_logits: bool,
+):
+    vocab_size = 17
+    logits = torch.arange(102, dtype=torch.float32).view(6, vocab_size)
+    processed_logits = logits + 1
+    sampled = torch.arange(8, dtype=torch.int64).view(2, 4)
+    num_sampled = torch.tensor([3, 4], dtype=torch.int32)
+    cu_num_logits_np = np.array([0, 3, 6], dtype=np.int32)
+    cu_num_logits = torch.from_numpy(cu_num_logits_np)
+    input_batch = SimpleNamespace(
+        input_ids=torch.arange(6),
+        logits_indices=torch.arange(6),
+        positions=torch.arange(6),
+        idx_mapping_np=np.array([0, 1], dtype=np.int32),
+        idx_mapping=torch.tensor([0, 1], dtype=torch.int32),
+        expanded_idx_mapping=torch.tensor([0, 0, 0, 1, 1, 1], dtype=torch.int32),
+        expanded_local_pos=torch.tensor([0, 1, 2, 0, 1, 2], dtype=torch.int32),
+        cu_num_logits_np=cu_num_logits_np,
+        cu_num_logits=cu_num_logits,
+        seq_lens=torch.tensor([3, 3], dtype=torch.int32),
+    )
+    rejection_sampler = object.__new__(RejectionSampler)
+    rejection_sampler.sampler = SimpleNamespace(
+        compute_nans=False,
+        logprobs_mode=logprobs_mode,
+        sampling_states=SimpleNamespace(max_num_logprobs=lambda _: -1),
+        req_states=SimpleNamespace(
+            prefill_len=SimpleNamespace(gpu=torch.zeros(2, dtype=torch.int32))
+        ),
+    )
+
+    def fake_verify(
+        self,
+        verify_logits,
+        _draft_logits,
+        _draft_sampled,
+        _pos,
+        verify_cu_num_logits,
+        *_mappings,
+    ):
+        assert verify_logits is logits
+        assert verify_cu_num_logits is cu_num_logits
+        return processed_logits, sampled, num_sampled
+
+    def fake_get_logprobs_tensors(
+        self,
+        verify_sampled,
+        verify_num_sampled,
+        score_logits,
+        score_cu_num_logits,
+        score_cu_num_logits_np,
+        _max_num_logprobs,
+    ):
+        assert verify_sampled is sampled
+        assert verify_num_sampled is num_sampled
+        assert score_logits is (processed_logits if use_processed_logits else logits)
+        assert score_cu_num_logits is cu_num_logits
+        assert score_cu_num_logits_np is cu_num_logits_np
+        return None
+
+    def fail_chunked_verify(*_args, **_kwargs):
+        pytest.fail("single-chunk verification used chunk orchestration")
+
+    rejection_sampler._verify = MethodType(fake_verify, rejection_sampler)
+    rejection_sampler._get_logprobs_tensors = MethodType(
+        fake_get_logprobs_tensors, rejection_sampler
+    )
+    rejection_sampler._verify_in_chunks = MethodType(
+        fail_chunked_verify, rejection_sampler
+    )
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu.spec_decode.rejection_sampler.get_num_sampled_and_rejected",
+        lambda values, *_args: (values, torch.zeros_like(values)),
+    )
+
+    assert logits.shape[0] <= MAX_CHUNK_BYTES // (vocab_size * _FP32_BYTES)
+    output = rejection_sampler(logits, input_batch)
+
+    assert output.sampled_token_ids is sampled
+    assert output.num_sampled is num_sampled
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
