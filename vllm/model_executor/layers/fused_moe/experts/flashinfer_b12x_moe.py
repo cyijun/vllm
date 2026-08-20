@@ -124,6 +124,22 @@ def _sanitize_b12x_topk(
     return safe_ids, safe_weights
 
 
+def _prepare_b12x_topk(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    quant_mode: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Prepare routes without masking work already handled by W4A16.
+
+    W4A16's direct and packed route paths both skip negative expert IDs.  Keep
+    the sanitizing fallback for the NVFP4/W4A4 implementation, whose kernels
+    still require every expert ID to be in range.
+    """
+    if quant_mode == "w4a16":
+        return topk_ids.to(torch.int32), topk_weights
+    return _sanitize_b12x_topk(topk_ids, topk_weights)
+
+
 class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
     """FlashInfer CuteDSL fused MoE expert for SM12x (SM120/SM121,
     RTX Pro 6000 / DGX Spark).
@@ -448,12 +464,10 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
             "process_weights_after_loading must run before FlashInferB12xExperts.apply"
         )
 
-        # vLLM uses -1 expert IDs for cudagraph/profile padding.  Most MoE
-        # backends consume that sentinel directly, while B12X requires every
-        # expert ID to be in range.  Route padding through expert 0 with a zero
-        # scale so the output remains zero without an out-of-bounds access.
-        token_selected_experts, token_final_scales = _sanitize_b12x_topk(
-            topk_ids, topk_weights
+        # vLLM uses -1 expert IDs for cudagraph/profile padding. W4A16 skips
+        # these routes in-kernel; NVFP4/W4A4 retains the safe expert-0 fallback.
+        token_selected_experts, token_final_scales = _prepare_b12x_topk(
+            topk_ids, topk_weights, self.quant_mode
         )
 
         # The functional API reuses FlashInfer's process-wide workspace cache.

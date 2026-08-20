@@ -45,6 +45,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.experts.flashinfer_b12x_moe import (
     FlashInferB12xExperts,
     _b12x_route_pack_token_capacities,
+    _prepare_b12x_topk,
     _sanitize_b12x_topk,
 )
 from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
@@ -297,6 +298,20 @@ def test_flashinfer_b12x_sanitizes_padding_routes():
     # Sanitization must not mutate tensors potentially reused by other stages.
     assert (topk_ids == -1).sum().item() == 3
     assert topk_weights[1, 1].item() == -2.0
+
+
+def test_flashinfer_b12x_w4a16_preserves_padding_routes():
+    topk_ids = torch.tensor([[3, -1, 5], [-1, -1, 2]], dtype=torch.int64, device="cuda")
+    topk_weights = torch.tensor(
+        [[0.5, 0.25, 0.125], [1.0, -2.0, 0.75]],
+        dtype=torch.float32,
+        device="cuda",
+    )
+
+    prepared_ids, prepared_weights = _prepare_b12x_topk(topk_ids, topk_weights, "w4a16")
+
+    torch.testing.assert_close(prepared_ids, topk_ids.to(torch.int32))
+    assert prepared_weights is topk_weights
 
 
 @pytest.mark.parametrize("requested_backend", ["auto", "flashinfer_b12x"])
