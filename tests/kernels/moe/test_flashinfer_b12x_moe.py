@@ -46,8 +46,10 @@ from vllm.model_executor.layers.fused_moe.experts.flashinfer_b12x_moe import (
     FlashInferB12xExperts,
     _apply_b12x_w4a16_ultrawide_compile_compat,
     _b12x_route_pack_token_capacities,
+    _legacy_b12x_token_ranges,
     _prepare_b12x_topk,
     _sanitize_b12x_topk,
+    _uses_legacy_b12x_runtime,
 )
 from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
     Mxfp4MoeBackend,
@@ -79,6 +81,19 @@ MNK_FACTORS = [
 )
 def test_b12x_route_pack_token_capacities(max_tokens, expected):
     assert _b12x_route_pack_token_capacities(max_tokens) == expected
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "expected"),
+    [
+        (1, ((0, 1),)),
+        (1024, ((0, 1024),)),
+        (1025, ((0, 1024), (1024, 1025))),
+        (2050, ((0, 1024), (1024, 2048), (2048, 2050))),
+    ],
+)
+def test_legacy_b12x_token_ranges(num_tokens, expected):
+    assert _legacy_b12x_token_ranges(num_tokens) == expected
 
 
 def test_b12x_w4a16_ultrawide_compile_compat():
@@ -477,14 +492,19 @@ def test_flashinfer_b12x_functional_adapter_cuda_graph(workspace_init):
         torch.testing.assert_close(output, eager_output, atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.parametrize("standalone_mxfp4", [False, True])
+@pytest.mark.parametrize(
+    ("standalone_mxfp4", "m"),
+    [(False, 8), (True, 8), (True, 1025)],
+)
 @torch.inference_mode()
-def test_flashinfer_b12x_mxfp4_moe(workspace_init, monkeypatch, standalone_mxfp4):
+def test_flashinfer_b12x_mxfp4_moe(workspace_init, monkeypatch, standalone_mxfp4, m):
     """Checkpoint-layout MXFP4 weights run through the B12X W4A16 path."""
     if standalone_mxfp4:
         pytest.importorskip("b12x")
+    if m > 1024 and not _uses_legacy_b12x_runtime():
+        pytest.skip("large-prefill chunking is specific to b12x 0.15.3")
     monkeypatch.setenv("VLLM_B12X_STANDALONE_MXFP4", str(int(standalone_mxfp4)))
-    m, n, k, e, topk = 8, 128, 256, 8, 2
+    n, k, e, topk = 128, 256, 8, 2
     dtype = torch.bfloat16
     set_random_seed(19)
 

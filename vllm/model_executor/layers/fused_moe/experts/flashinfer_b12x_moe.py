@@ -37,11 +37,23 @@ logger = init_logger(__name__)
 
 
 _B12X_ROUTE_PACK_WARMED: set[tuple[str, int, int, int, int]] = set()
+_LEGACY_B12X_MAX_TOKENS_PER_LAUNCH = 1024
 
 
 def _uses_legacy_b12x_runtime() -> bool:
     """Whether the installed package exposes Anemll's 0.15.3 TP-MoE API."""
     return importlib.metadata.version("b12x") == "0.15.3"
+
+
+def _legacy_b12x_token_ranges(num_tokens: int) -> tuple[tuple[int, int], ...]:
+    """Split legacy W4A16 launches before its 2K route-capacity cliff."""
+    return tuple(
+        (
+            start,
+            min(start + _LEGACY_B12X_MAX_TOKENS_PER_LAUNCH, num_tokens),
+        )
+        for start in range(0, num_tokens, _LEGACY_B12X_MAX_TOKENS_PER_LAUNCH)
+    )
 
 
 def _apply_b12x_w4a16_ultrawide_compile_compat() -> None:
@@ -804,8 +816,13 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
                 if self._legacy_standalone_mxfp4
                 else _standalone_b12x_execution_plan
             )
+            plan_max_tokens = (
+                min(M, _LEGACY_B12X_MAX_TOKENS_PER_LAUNCH)
+                if self._legacy_standalone_mxfp4
+                else M
+            )
             plan = plan_fn(
-                max_tokens=M,
+                max_tokens=plan_max_tokens,
                 num_experts=self.global_num_experts,
                 hidden_size=self.hidden_dim,
                 intermediate_size=self.intermediate_size_per_partition,
@@ -885,53 +902,55 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
                 assert self._standalone_b12x_device is not None
                 from b12x.integration.tp_moe import b12x_moe_fp4
 
-                plan = _legacy_b12x_execution_plan(
-                    max_tokens=hidden_states.shape[0],
-                    num_experts=self.global_num_experts,
-                    hidden_size=self.hidden_dim,
-                    intermediate_size=self.intermediate_size_per_partition,
-                    topk=self.topk,
-                    device=str(self._standalone_b12x_device),
-                    activation=self._activation_str,
-                    params_dtype=self.out_dtype,
-                    swiglu_limit=self.swiglu_limit,
-                )
                 if workspace2 is None:
                     raise RuntimeError(
                         "standalone b12x MXFP4 requires workspace2 scratch"
                     )
                 scratch = workspace2.reshape(-1).view(torch.uint8)
-                required_nbytes = _standalone_b12x_scratch_nbytes(plan)
-                if scratch.numel() < required_nbytes:
-                    raise ValueError(
-                        "b12x 0.15.3 MXFP4 workspace2 is too small: "
-                        f"have={scratch.numel()} bytes, need={required_nbytes} bytes"
+                for start, end in _legacy_b12x_token_ranges(hidden_states.shape[0]):
+                    plan = _legacy_b12x_execution_plan(
+                        max_tokens=end - start,
+                        num_experts=self.global_num_experts,
+                        hidden_size=self.hidden_dim,
+                        intermediate_size=self.intermediate_size_per_partition,
+                        topk=self.topk,
+                        device=str(self._standalone_b12x_device),
+                        activation=self._activation_str,
+                        params_dtype=self.out_dtype,
+                        swiglu_limit=self.swiglu_limit,
                     )
-                binding = plan.bind(
-                    scratch=scratch[:required_nbytes],
-                    a=hidden_states,
-                    a1_gscale=self._w1_alpha,
-                    w1_fp4=w1,
-                    w1_blockscale=self.w1_sf_mma,
-                    w1_alphas=self._w1_alpha,
-                    a2_gscale=self._w2_alpha,
-                    w2_fp4=w2,
-                    w2_blockscale=self.w2_sf_mma,
-                    w2_alphas=self._w2_alpha,
-                    topk_weights=token_final_scales,
-                    topk_ids=token_selected_experts,
-                    output=output,
-                    input_scales_are_reciprocal=True,
-                    input_scales_static=True,
-                    activation=self._activation_str,
-                    quant_mode="w4a16",
-                    unit_scale_contract=True,
-                    source_format=self.source_format,
-                    w13_layout="w13",
-                    prepared_w4a16=self._prepared_w4a16,
-                    swiglu_limit=self.swiglu_limit,
-                )
-                b12x_moe_fp4(binding=binding)
+                    required_nbytes = _standalone_b12x_scratch_nbytes(plan)
+                    if scratch.numel() < required_nbytes:
+                        raise ValueError(
+                            "b12x 0.15.3 MXFP4 workspace2 is too small: "
+                            f"have={scratch.numel()} bytes, "
+                            f"need={required_nbytes} bytes"
+                        )
+                    binding = plan.bind(
+                        scratch=scratch[:required_nbytes],
+                        a=hidden_states[start:end],
+                        a1_gscale=self._w1_alpha,
+                        w1_fp4=w1,
+                        w1_blockscale=self.w1_sf_mma,
+                        w1_alphas=self._w1_alpha,
+                        a2_gscale=self._w2_alpha,
+                        w2_fp4=w2,
+                        w2_blockscale=self.w2_sf_mma,
+                        w2_alphas=self._w2_alpha,
+                        topk_weights=token_final_scales[start:end],
+                        topk_ids=token_selected_experts[start:end],
+                        output=output[start:end],
+                        input_scales_are_reciprocal=True,
+                        input_scales_static=True,
+                        activation=self._activation_str,
+                        quant_mode="w4a16",
+                        unit_scale_contract=True,
+                        source_format=self.source_format,
+                        w13_layout="w13",
+                        prepared_w4a16=self._prepared_w4a16,
+                        swiglu_limit=self.swiglu_limit,
+                    )
+                    b12x_moe_fp4(binding=binding)
                 return
 
             assert self._standalone_b12x_experts is not None
