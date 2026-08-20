@@ -47,6 +47,7 @@ from vllm.model_executor.layers.fused_moe.experts.flashinfer_b12x_moe import (
     _apply_b12x_w4a16_ultrawide_compile_compat,
     _b12x_route_pack_token_capacities,
     _legacy_b12x_token_ranges,
+    _parse_b12x_w4a16_tile_config,
     _prepare_b12x_topk,
     _sanitize_b12x_topk,
     _uses_legacy_b12x_runtime,
@@ -94,6 +95,21 @@ def test_b12x_route_pack_token_capacities(max_tokens, expected):
 )
 def test_legacy_b12x_token_ranges(num_tokens, expected):
     assert _legacy_b12x_token_ranges(num_tokens) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw_config", "expected"),
+    [("", None), ("128, 64, 128", (128, 64, 128))],
+)
+def test_parse_b12x_w4a16_tile_config(monkeypatch, raw_config, expected):
+    monkeypatch.setenv("VLLM_B12X_W4A16_FORCE_TILE_CONFIG", raw_config)
+    assert _parse_b12x_w4a16_tile_config() == expected
+
+
+def test_parse_b12x_w4a16_tile_config_rejects_wrong_arity(monkeypatch):
+    monkeypatch.setenv("VLLM_B12X_W4A16_FORCE_TILE_CONFIG", "128,64")
+    with pytest.raises(ValueError, match="TILE_K,TILE_N,CTA_THREADS"):
+        _parse_b12x_w4a16_tile_config()
 
 
 def test_b12x_w4a16_ultrawide_compile_compat():

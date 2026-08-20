@@ -201,6 +201,9 @@ if TYPE_CHECKING:
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
     VLLM_B12X_NVFP4_W4A16: bool = False
     VLLM_B12X_STANDALONE_MXFP4: bool = False
+    VLLM_B12X_W4A16_FORCE_BLOCKS_PER_SM: int = 0
+    VLLM_B12X_W4A16_FORCE_BLOCKS_MAX_M: int = 16
+    VLLM_B12X_W4A16_FORCE_TILE_CONFIG: str = ""
     VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR: str | None = None
     VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS: list[str] | None = None
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
@@ -1566,6 +1569,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # scratch and CUDA-graph lowering with FlashInfer's functional adapter.
     "VLLM_B12X_STANDALONE_MXFP4": lambda: bool(
         int(os.getenv("VLLM_B12X_STANDALONE_MXFP4", "0"))
+    ),
+    "VLLM_B12X_W4A16_FORCE_BLOCKS_PER_SM": lambda: int(
+        os.getenv("VLLM_B12X_W4A16_FORCE_BLOCKS_PER_SM", "0")
+    ),
+    "VLLM_B12X_W4A16_FORCE_BLOCKS_MAX_M": lambda: int(
+        os.getenv("VLLM_B12X_W4A16_FORCE_BLOCKS_MAX_M", "16")
+    ),
+    "VLLM_B12X_W4A16_FORCE_TILE_CONFIG": lambda: os.getenv(
+        "VLLM_B12X_W4A16_FORCE_TILE_CONFIG", ""
     ),
     # Control the cache sized used by the xgrammar compiler. The default
     # of 512 MB should be enough for roughly 1000 JSON schemas.

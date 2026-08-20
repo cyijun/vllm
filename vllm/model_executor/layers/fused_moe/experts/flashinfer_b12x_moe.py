@@ -3,8 +3,9 @@
 
 import functools
 import importlib.metadata
+from collections.abc import Callable
 from dataclasses import replace
-from typing import Any
+from typing import Any, cast
 
 import torch
 
@@ -53,6 +54,149 @@ def _legacy_b12x_token_ranges(num_tokens: int) -> tuple[tuple[int, int], ...]:
             min(start + _LEGACY_B12X_MAX_TOKENS_PER_LAUNCH, num_tokens),
         )
         for start in range(0, num_tokens, _LEGACY_B12X_MAX_TOKENS_PER_LAUNCH)
+    )
+
+
+def _parse_b12x_w4a16_tile_config() -> tuple[int, int, int] | None:
+    raw_config = str(envs.VLLM_B12X_W4A16_FORCE_TILE_CONFIG).strip()
+    if not raw_config:
+        return None
+    parts = [part.strip() for part in raw_config.split(",")]
+    if len(parts) != 3:
+        raise ValueError(
+            "VLLM_B12X_W4A16_FORCE_TILE_CONFIG must be "
+            "TILE_K,TILE_N,CTA_THREADS, got "
+            f"{raw_config!r}"
+        )
+    return cast(tuple[int, int, int], tuple(int(part) for part in parts))
+
+
+def _forced_b12x_w4a16_tile_blocks_per_sm(
+    w4a16_kernel: Any,
+    kwargs: dict[str, Any],
+    tile_config: tuple[int, int, int],
+) -> int | None:
+    required_names = (
+        "problem_m",
+        "problem_n",
+        "problem_k",
+        "top_k",
+        "moe_block_size",
+        "sms",
+        "max_shared_mem",
+    )
+    if any(name not in kwargs for name in required_names):
+        return None
+
+    tile_k, tile_n, cta_threads = tile_config
+    required_cta_threads = kwargs.get("required_cta_threads")
+    if required_cta_threads is not None and int(required_cta_threads) != cta_threads:
+        return None
+    try:
+        cta_m_blocks = w4a16_kernel._covering_count(int(kwargs["moe_block_size"]), 16)
+        tile_fits = w4a16_kernel._candidate_tile_fits(
+            problem_n=int(kwargs["problem_n"]),
+            problem_k=int(kwargs["problem_k"]),
+            cta_m_blocks=cta_m_blocks,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            cta_threads=cta_threads,
+            max_shared_mem=int(kwargs["max_shared_mem"]) - 512,
+            scale_format=kwargs.get("scale_format", "e4m3_k16"),
+        )
+    except Exception:
+        return None
+    if not tile_fits:
+        return None
+
+    try:
+        return int(
+            w4a16_kernel._determine_blocks_per_sm(
+                problem_m=int(kwargs["problem_m"]),
+                problem_n=int(kwargs["problem_n"]),
+                top_k=int(kwargs["top_k"]),
+                cta_threads=cta_threads,
+                cta_m_blocks=cta_m_blocks,
+                tile_n=tile_n,
+                tile_k=tile_k,
+                uses_m_block_8=int(kwargs["moe_block_size"]) == 8,
+                sms=int(kwargs["sms"]),
+                max_shared_mem=int(kwargs["max_shared_mem"]),
+                scale_format=kwargs.get("scale_format", "e4m3_k16"),
+            )
+        )
+    except Exception:
+        return None
+
+
+def _maybe_apply_legacy_b12x_w4a16_selector_override() -> None:
+    if not _uses_legacy_b12x_runtime():
+        return
+
+    forced_blocks_per_sm = int(envs.VLLM_B12X_W4A16_FORCE_BLOCKS_PER_SM)
+    forced_tile_config = _parse_b12x_w4a16_tile_config()
+    max_problem_m = int(envs.VLLM_B12X_W4A16_FORCE_BLOCKS_MAX_M)
+    if forced_blocks_per_sm < 0:
+        raise ValueError(
+            "VLLM_B12X_W4A16_FORCE_BLOCKS_PER_SM must be >= 0, got "
+            f"{forced_blocks_per_sm}"
+        )
+    if max_problem_m < 0:
+        raise ValueError(
+            f"VLLM_B12X_W4A16_FORCE_BLOCKS_MAX_M must be >= 0, got {max_problem_m}"
+        )
+    if forced_blocks_per_sm == 0 and forced_tile_config is None:
+        return
+
+    from b12x.moe.fused.w4a16 import kernel as w4a16_kernel
+
+    original_attr = "_vllm_original_select_tile_config"
+    if hasattr(w4a16_kernel, original_attr):
+        return
+    original_select_tile_config = getattr(w4a16_kernel, "_select_tile_config", None)
+    if not callable(original_select_tile_config):
+        logger.warning(
+            "Could not install legacy B12X W4A16 selector override; "
+            "_select_tile_config is missing."
+        )
+        return
+    setattr(w4a16_kernel, original_attr, original_select_tile_config)
+
+    def _vllm_select_tile_config(
+        *args: Any, **kwargs: Any
+    ) -> tuple[int, int, int, int]:
+        selected = original_select_tile_config(*args, **kwargs)
+        problem_m = kwargs.get("problem_m")
+        if problem_m is None:
+            return selected
+        active_max_problem_m = int(envs.VLLM_B12X_W4A16_FORCE_BLOCKS_MAX_M)
+        if active_max_problem_m > 0 and int(problem_m) > active_max_problem_m:
+            return selected
+
+        active_tile_config = _parse_b12x_w4a16_tile_config()
+        if active_tile_config is not None:
+            forced_tile_blocks_per_sm = _forced_b12x_w4a16_tile_blocks_per_sm(
+                w4a16_kernel,
+                kwargs,
+                active_tile_config,
+            )
+            if forced_tile_blocks_per_sm is not None:
+                selected = (*active_tile_config, forced_tile_blocks_per_sm)
+
+        active_forced_blocks_per_sm = int(envs.VLLM_B12X_W4A16_FORCE_BLOCKS_PER_SM)
+        if active_forced_blocks_per_sm > 0:
+            selected = (*selected[:3], active_forced_blocks_per_sm)
+        return selected
+
+    w4a16_kernel._select_tile_config = cast(
+        Callable[..., tuple[int, int, int, int]], _vllm_select_tile_config
+    )
+    logger.info(
+        "Enabled legacy B12X W4A16 selector override: tile_config=%s, "
+        "blocks_per_sm=%d, problem_m<=%d",
+        forced_tile_config,
+        forced_blocks_per_sm,
+        max_problem_m,
     )
 
 
@@ -523,6 +667,8 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
         if self._standalone_mxfp4:
             if self._legacy_standalone_mxfp4:
                 from b12x.integration import prepare_b12x_fp4_moe_weights
+
+                _maybe_apply_legacy_b12x_w4a16_selector_override()
 
                 unit_scale = torch.ones(
                     self.num_local_experts,
