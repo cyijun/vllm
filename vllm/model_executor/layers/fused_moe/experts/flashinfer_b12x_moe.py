@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import functools
+from dataclasses import replace
 from typing import Any
 
 import torch
@@ -93,7 +94,10 @@ def _standalone_b12x_execution_plan(
             device=device,
             weight_plan=weight_plan,
             core_token_counts=(max(int(max_tokens), 1),),
-            route_num_experts=0,
+            # The standalone API uses zero to disable route workspace.  Size
+            # it explicitly so packed M>decode paths never allocate while a
+            # CUDA graph is being captured.
+            route_num_experts=num_experts,
             quant_mode="w4a16",
             apply_router_weight_on_input=False,
             swiglu_limit=swiglu_limit,
@@ -132,6 +136,70 @@ def _workspace_as_standalone_b12x_scratch(
             f"have={scratch.numel()} bytes, need={required_nbytes} bytes"
         )
     return scratch[:required_nbytes]
+
+
+def _run_standalone_b12x(fused_moe: Any, binding: Any) -> torch.Tensor:
+    """Run a planned binding with its caller-owned route-count workspace.
+
+    b12x 1.2.4 binds ``expert_counts`` but its public runner forwards that
+    tensor only for Trellis weights.  General packed W4A16 then tries to make
+    a temporary route-count tensor and fails during CUDA graph capture.  Use
+    the same planned launch with the already-bound tensor until the public
+    runner forwards it for every packed W4A16 layout.
+    """
+    if binding.implementation != "w4a16" or binding.expert_counts is None:
+        return fused_moe.run(binding=binding)
+
+    prepared = binding.experts.representation_for("w4a16")
+    if getattr(prepared, "weight_layout", "") == "trellis3_t256":
+        return fused_moe.run(binding=binding)
+
+    from b12x.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
+
+    required_fields = (
+        "output",
+        "intermediate_cache13",
+        "intermediate_cache2",
+        "packed_route_indices",
+        "block_expert_ids",
+        "packed_route_count",
+        "expert_offsets",
+    )
+    missing = [name for name in required_fields if getattr(binding, name) is None]
+    if missing:
+        raise RuntimeError(
+            "standalone b12x W4A16 binding is missing: " + ", ".join(missing)
+        )
+
+    return run_w4a16_moe(
+        binding.a,
+        prepared,
+        binding.topk_weights,
+        binding.topk_ids,
+        activation=binding.experts.activation,
+        apply_router_weight_on_input=binding.apply_router_weight_on_input,
+        fast_math=binding.fast_math,
+        intermediate_cache13=binding.intermediate_cache13,
+        intermediate_cache2=binding.intermediate_cache2,
+        output=binding.output,
+        fc1_c_tmp=binding.fc1_c_tmp,
+        fc2_c_tmp=binding.fc2_c_tmp,
+        packed_route_indices=binding.packed_route_indices,
+        block_expert_ids=binding.block_expert_ids,
+        packed_route_count=binding.packed_route_count,
+        expert_offsets=binding.expert_offsets,
+        expert_counts=binding.expert_counts,
+        expert_map=binding.route_expert_map,
+        output_expert_map=binding.output_expert_map,
+        activation_amax=binding.activation_amax,
+        layer_idx=binding.layer_idx,
+        swiglu_limit=binding.swiglu_limit,
+        swiglu_alpha=binding.swiglu_alpha,
+        swiglu_beta=binding.swiglu_beta,
+        fused_launch=binding.fused_launch,
+        topk_sum_launch=binding.topk_sum_launch,
+        route_block_size_m=binding.route_block_size_m,
+    )
 
 
 def _b12x_route_pack_token_capacities(max_tokens: int) -> tuple[int, ...]:
@@ -666,7 +734,17 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
                 input_scales_static=True,
                 unit_scale_contract=True,
             )
-            fused_moe.run(binding=binding)
+            if binding.implementation == "w4a16" and binding.expert_counts is None:
+                expert_counts_nbytes = self.global_num_experts * 4
+                if plan.layout.route_workspace_nbytes < expert_counts_nbytes:
+                    raise RuntimeError(
+                        "standalone b12x route workspace cannot hold expert counts"
+                    )
+                binding = replace(
+                    binding,
+                    expert_counts=scratch[:expert_counts_nbytes].view(torch.int32),
+                )
+            _run_standalone_b12x(fused_moe, binding)
             return
 
         # The functional API reuses FlashInfer's process-wide workspace cache.

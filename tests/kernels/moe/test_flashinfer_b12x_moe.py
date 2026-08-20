@@ -585,6 +585,90 @@ def test_flashinfer_b12x_mxfp4_moe(workspace_init, monkeypatch, standalone_mxfp4
         torch.testing.assert_close(graph_output, eager_output, atol=1e-2, rtol=1e-2)
 
 
+@torch.inference_mode()
+def test_flashinfer_b12x_standalone_packed_route_cuda_graph(
+    workspace_init, monkeypatch
+):
+    """Packed W4A16 routing must use caller-owned expert-count scratch."""
+    pytest.importorskip("b12x.moe")
+    monkeypatch.setenv("VLLM_B12X_STANDALONE_MXFP4", "1")
+    m, n, k, e, topk = 36, 128, 256, 256, 6
+    dtype = torch.bfloat16
+
+    with set_current_vllm_config(
+        VllmConfig(parallel_config=ParallelConfig(pipeline_parallel_size=1))
+    ):
+        w13 = torch.randint(
+            0, 256, (e, 2 * n, k // 2), dtype=torch.uint8, device="cuda"
+        )
+        w2 = torch.randint(0, 256, (e, k, n // 2), dtype=torch.uint8, device="cuda")
+        w13_scale = torch.ones(
+            (e, 2 * n, k // 32), dtype=torch.float8_e8m0fnu, device="cuda"
+        )
+        w2_scale = torch.ones(
+            (e, k, n // 32), dtype=torch.float8_e8m0fnu, device="cuda"
+        )
+        layer = SimpleNamespace(
+            w13_weight=w13,
+            w2_weight=w2,
+            w13_weight_scale=w13_scale,
+            w2_weight_scale=w2_scale,
+        )
+        quant_config = ocp_mx_moe_quant_config(
+            quant_dtype="mxfp4", w1_scale=w13_scale, w2_scale=w2_scale
+        )
+        moe_config = make_dummy_moe_config(
+            num_experts=e,
+            experts_per_token=topk,
+            hidden_dim=k,
+            intermediate_size=n,
+            in_dtype=dtype,
+            swiglu_limit=10.0,
+        )
+        experts = FlashInferB12xExperts(moe_config, quant_config)
+        experts.process_weights_after_loading(layer)
+
+        hidden_states = torch.randn((m, k), dtype=dtype, device="cuda")
+        output = torch.empty_like(hidden_states)
+        topk_ids = torch.randint(0, e, (m, topk), dtype=torch.int64, device="cuda")
+        topk_weights = torch.rand((m, topk), dtype=torch.float32, device="cuda")
+        _, workspace_shape, _ = experts.workspace_shapes(
+            m, 2 * n, k, topk, e, e, None, MoEActivation.SILU
+        )
+        workspace = torch.empty(workspace_shape, dtype=dtype, device="cuda")
+
+        def apply() -> None:
+            experts.apply(
+                output=output,
+                hidden_states=hidden_states,
+                w1=w13,
+                w2=w2,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                activation=MoEActivation.SILU,
+                global_num_experts=e,
+                expert_map=None,
+                a1q_scale=None,
+                a2_scale=None,
+                workspace13=None,
+                workspace2=workspace,
+                expert_tokens_meta=None,
+                apply_router_weight_on_input=False,
+            )
+
+        apply()
+        torch.accelerator.synchronize()
+        eager_output = output.clone()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            apply()
+        graph.replay()
+        torch.accelerator.synchronize()
+
+        assert torch.isfinite(output).all()
+        torch.testing.assert_close(output, eager_output, atol=1e-2, rtol=1e-2)
+
+
 @pytest.mark.parametrize("m,n,k", MNK_FACTORS)
 @pytest.mark.parametrize("e", [8, 16])
 @pytest.mark.parametrize("topk", [1, 2, 4])
