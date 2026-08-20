@@ -44,6 +44,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.experts.flashinfer_b12x_moe import (
     FlashInferB12xExperts,
+    _apply_b12x_w4a16_ultrawide_compile_compat,
     _b12x_route_pack_token_capacities,
     _prepare_b12x_topk,
     _sanitize_b12x_topk,
@@ -78,6 +79,57 @@ MNK_FACTORS = [
 )
 def test_b12x_route_pack_token_capacities(max_tokens, expected):
     assert _b12x_route_pack_token_capacities(max_tokens) == expected
+
+
+def test_b12x_w4a16_ultrawide_compile_compat():
+    """b12x 1.2.4 must accept the M=1 E8M0 tile it auto-selects."""
+    pytest.importorskip("b12x.moe")
+    _apply_b12x_w4a16_ultrawide_compile_compat()
+
+    from b12x.moe._shared.kernels.w4a16.kernel import (
+        compile_w4a16_fused_moe,
+    )
+
+    props = torch.cuda.get_device_properties(0)
+    kwargs = dict(
+        size_m=1,
+        hidden_size=4096,
+        intermediate_size=1024,
+        num_experts=256,
+        top_k=6,
+        activation="silu",
+        apply_router_weight_on_input=False,
+        zero_fc2_output=False,
+        moe_block_size=8,
+        max_m_blocks=6,
+        element_dtype="bf16",
+        fast_math=True,
+        sms=48,
+        max_shared_mem=props.shared_memory_per_block_optin,
+        swiglu_limit=10.0,
+        swiglu_alpha=1.0,
+        swiglu_beta=0.0,
+        weight_layout="packed",
+        scale_format="e8m0_k32",
+        w13_layout="w13",
+        direct_topk_routes=True,
+        tc_decode_fused_sum=True,
+    )
+    automatic = compile_w4a16_fused_moe(**kwargs)
+    selected = (
+        automatic.fc1_tile_k,
+        automatic.fc1_tile_n,
+        automatic.fc2_tile_k,
+        automatic.fc2_tile_n,
+    )
+    assert selected == (64, 256, 32, 512)
+    forced = compile_w4a16_fused_moe(**kwargs, force_tile_config=selected)
+    assert (
+        forced.fc1_tile_k,
+        forced.fc1_tile_n,
+        forced.fc2_tile_k,
+        forced.fc2_tile_n,
+    ) == selected
 
 
 def _process_b12x_weights(

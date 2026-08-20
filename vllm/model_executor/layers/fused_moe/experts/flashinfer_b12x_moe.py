@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import functools
+import importlib.metadata
 from dataclasses import replace
 from typing import Any
 
@@ -36,6 +37,57 @@ logger = init_logger(__name__)
 
 
 _B12X_ROUTE_PACK_WARMED: set[tuple[str, int, int, int, int]] = set()
+
+
+def _apply_b12x_w4a16_ultrawide_compile_compat() -> None:
+    """Keep b12x 1.2.4's valid M=1 ultra-wide tile self-consistent.
+
+    Its first compile intentionally validates the E8M0 FC2 (K=32, N=512)
+    tile by footprint because the generic selector has a K>=64 floor.  The
+    registered launch compiles the same tile a second time as an explicit
+    pin, where 1.2.4 accidentally sends it through that generic validator.
+    Re-run only this exact pin through the original automatic selection and
+    accept it only when the selected tile is byte-for-byte identical.
+    """
+    if importlib.metadata.version("b12x") != "1.2.4":
+        return
+
+    from b12x.moe._shared.kernels.w4a16 import kernel as w4a16_kernel
+
+    original_attr = "_vllm_original_compile_w4a16_fused_moe"
+    if hasattr(w4a16_kernel, original_attr):
+        return
+    original_compile = w4a16_kernel.compile_w4a16_fused_moe
+    setattr(w4a16_kernel, original_attr, original_compile)
+
+    @functools.wraps(original_compile)
+    def compile_compat(*args: Any, **kwargs: Any) -> Any:
+        forced = kwargs.get("force_tile_config")
+        forced_tuple = None if forced is None else tuple(int(value) for value in forced)
+        is_ultrawide_decode = (
+            forced_tuple is not None
+            and forced_tuple[2:] == (32, 512)
+            and int(kwargs.get("size_m", -1)) == 1
+            and bool(kwargs.get("tc_decode_fused_sum", False))
+            and kwargs.get("weight_layout") == "packed"
+            and kwargs.get("scale_format") == "e8m0_k32"
+        )
+        if is_ultrawide_decode:
+            automatic_kwargs = dict(kwargs)
+            automatic_kwargs["force_tile_config"] = None
+            compiled = original_compile(*args, **automatic_kwargs)
+            selected = (
+                int(compiled.fc1_tile_k),
+                int(compiled.fc1_tile_n),
+                int(compiled.fc2_tile_k),
+                int(compiled.fc2_tile_n),
+            )
+            if selected == forced_tuple:
+                return compiled
+        return original_compile(*args, **kwargs)
+
+    w4a16_kernel.compile_w4a16_fused_moe = compile_compat
+    logger.info("Enabled b12x 1.2.4 M=1 ultra-wide W4A16 compile compatibility")
 
 
 @functools.lru_cache
@@ -94,10 +146,10 @@ def _standalone_b12x_execution_plan(
             device=device,
             weight_plan=weight_plan,
             core_token_counts=(max(int(max_tokens), 1),),
-            # The standalone API uses zero to disable route workspace.  Size
-            # it explicitly so packed M>decode paths never allocate while a
-            # CUDA graph is being captured.
-            route_num_experts=num_experts,
+            # Routing ids/weights arrive preselected from vLLM; disable the
+            # unrelated logits-routing arena. Packed-route buffers remain in
+            # the core plan, and expert counts use vLLM's fixed scratch tail.
+            route_num_experts=0,
             quant_mode="w4a16",
             apply_router_weight_on_input=False,
             swiglu_limit=swiglu_limit,
@@ -404,6 +456,8 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if self._standalone_mxfp4:
             from b12x.moe import fused_moe
+
+            _apply_b12x_w4a16_ultrawide_compile_compat()
 
             unit_scale = torch.ones(
                 self.num_local_experts,
