@@ -586,13 +586,12 @@ def test_flashinfer_b12x_mxfp4_moe(workspace_init, monkeypatch, standalone_mxfp4
 
 
 @torch.inference_mode()
-def test_flashinfer_b12x_standalone_packed_route_cuda_graph(
-    workspace_init, monkeypatch
-):
-    """Packed W4A16 routing must use caller-owned expert-count scratch."""
+@pytest.mark.parametrize("m", [1, 36])
+def test_flashinfer_b12x_standalone_route_cuda_graph(workspace_init, monkeypatch, m):
+    """Decode and packed W4A16 routing use caller-owned count scratch."""
     pytest.importorskip("b12x.moe")
     monkeypatch.setenv("VLLM_B12X_STANDALONE_MXFP4", "1")
-    m, n, k, e, topk = 36, 128, 256, 256, 6
+    n, k, e, topk = 128, 256, 256, 6
     dtype = torch.bfloat16
 
     with set_current_vllm_config(
@@ -602,11 +601,17 @@ def test_flashinfer_b12x_standalone_packed_route_cuda_graph(
             0, 256, (e, 2 * n, k // 2), dtype=torch.uint8, device="cuda"
         )
         w2 = torch.randint(0, 256, (e, k, n // 2), dtype=torch.uint8, device="cuda")
-        w13_scale = torch.ones(
-            (e, 2 * n, k // 32), dtype=torch.float8_e8m0fnu, device="cuda"
+        w13_scale = torch.full(
+            (e, 2 * n, k // 32),
+            dtype=torch.float8_e8m0fnu,
+            device="cuda",
+            fill_value=0.0625,
         )
-        w2_scale = torch.ones(
-            (e, k, n // 32), dtype=torch.float8_e8m0fnu, device="cuda"
+        w2_scale = torch.full(
+            (e, k, n // 32),
+            dtype=torch.float8_e8m0fnu,
+            device="cuda",
+            fill_value=0.0625,
         )
         layer = SimpleNamespace(
             w13_weight=w13,
@@ -666,7 +671,10 @@ def test_flashinfer_b12x_standalone_packed_route_cuda_graph(
         torch.accelerator.synchronize()
 
         assert torch.isfinite(output).all()
-        torch.testing.assert_close(output, eager_output, atol=1e-2, rtol=1e-2)
+        # TC-decode atomically accumulates top-k routes, so BF16 rounding can
+        # vary slightly between eager and graph launch order at M=1.
+        tolerance = 1e-1 if m == 1 else 1e-2
+        torch.testing.assert_close(output, eager_output, atol=tolerance, rtol=tolerance)
 
 
 @pytest.mark.parametrize("m,n,k", MNK_FACTORS)

@@ -123,19 +123,25 @@ def _standalone_b12x_scratch_nbytes(plan: Any) -> int:
 def _workspace_as_standalone_b12x_scratch(
     workspace: torch.Tensor | None,
     plan: Any,
-) -> torch.Tensor:
+    num_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
     if workspace is None:
         raise RuntimeError("standalone b12x MXFP4 requires workspace2 scratch")
     if not workspace.is_contiguous():
         raise ValueError("standalone b12x MXFP4 workspace2 must be contiguous")
     scratch = workspace.reshape(-1).view(torch.uint8)
     required_nbytes = _standalone_b12x_scratch_nbytes(plan)
-    if scratch.numel() < required_nbytes:
+    expert_counts_nbytes = int(num_experts) * 4
+    total_nbytes = required_nbytes + expert_counts_nbytes
+    if scratch.numel() < total_nbytes:
         raise ValueError(
             "standalone b12x MXFP4 workspace2 is too small: "
-            f"have={scratch.numel()} bytes, need={required_nbytes} bytes"
+            f"have={scratch.numel()} bytes, need={total_nbytes} bytes"
         )
-    return scratch[:required_nbytes]
+    expert_counts = scratch[
+        required_nbytes : required_nbytes + expert_counts_nbytes
+    ].view(torch.int32)
+    return scratch[:required_nbytes], expert_counts
 
 
 def _run_standalone_b12x(fused_moe: Any, binding: Any) -> torch.Tensor:
@@ -650,6 +656,11 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
                 swiglu_limit=self.swiglu_limit,
             )
             scratch_nbytes = _standalone_b12x_scratch_nbytes(plan)
+            # b12x's route workspace scales with M and can be smaller than an
+            # E-wide count array at decode.  Keep expert counts in a fixed,
+            # caller-owned tail so both eager warmup and CUDA graphs are
+            # allocation-free without depending on b12x's private layout.
+            scratch_nbytes += self.global_num_experts * 4
             element_size = torch.empty((), dtype=self.out_dtype).element_size()
             workspace2 = ((scratch_nbytes + element_size - 1) // element_size,)
             return (1,), workspace2, (M, K)
@@ -722,7 +733,9 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
                 params_dtype=self.out_dtype,
                 swiglu_limit=self.swiglu_limit,
             )
-            scratch = _workspace_as_standalone_b12x_scratch(workspace2, plan)
+            scratch, expert_counts = _workspace_as_standalone_b12x_scratch(
+                workspace2, plan, self.global_num_experts
+            )
             binding = fused_moe.bind(
                 plan,
                 scratch=scratch,
@@ -734,16 +747,15 @@ class FlashInferB12xExperts(mk.FusedMoEExpertsModular):
                 input_scales_static=True,
                 unit_scale_contract=True,
             )
-            if binding.implementation == "w4a16" and binding.expert_counts is None:
-                expert_counts_nbytes = self.global_num_experts * 4
-                if plan.layout.route_workspace_nbytes < expert_counts_nbytes:
-                    raise RuntimeError(
-                        "standalone b12x route workspace cannot hold expert counts"
-                    )
-                binding = replace(
-                    binding,
-                    expert_counts=scratch[:expert_counts_nbytes].view(torch.int32),
-                )
+            uses_packed_routes = not bool(
+                getattr(binding.fused_launch, "direct_topk_routes", False)
+            )
+            if (
+                binding.implementation == "w4a16"
+                and uses_packed_routes
+                and binding.expert_counts is None
+            ):
+                binding = replace(binding, expert_counts=expert_counts)
             _run_standalone_b12x(fused_moe, binding)
             return
 
