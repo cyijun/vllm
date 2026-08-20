@@ -113,6 +113,10 @@ def _standalone_b12x_weight_plan(
         # vLLM's B12X conversion has already changed checkpoint [gate, up]
         # rows to the B12X logical [up, gate] order.
         w13_layout="w13",
+        # The source-native/modelopt layout leaves the W4A16 kernel roughly
+        # twice as slow at the draft model's C6 decode shape on GB10.  Match
+        # the packed layout used by Anemll's proven b12x integration.
+        w4a16_layout="mma_packed",
     )
 
 

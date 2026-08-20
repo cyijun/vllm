@@ -548,6 +548,8 @@ def test_flashinfer_b12x_mxfp4_moe(workspace_init, monkeypatch, standalone_mxfp4
         experts = FlashInferB12xExperts(moe_config, quant_config)
         experts.process_weights_after_loading(layer)
         assert experts._prepared_w4a16 is not None
+        if standalone_mxfp4:
+            assert experts._prepared_w4a16.weight_layout == "packed"
         assert experts._prepared_w4a16.w13.data_ptr() == w13_q.data_ptr()
         assert experts._prepared_w4a16.w2.data_ptr() == w2_q.data_ptr()
         assert experts._prepared_w4a16.w13_scale.data_ptr() == w13_scale.data_ptr()
